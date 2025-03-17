@@ -103,6 +103,11 @@ def parse_args():
                         help="Dropout percentage during training. \
                             This dropout rate is applied to all layer (including the input layer).",
                   )
+    parser.add_argument('--ckpt',
+                        default = None,
+                        type=str,
+                        help="Save/resume from checkpoint path.",
+                  )
 
     return parser.parse_args()
 
@@ -170,36 +175,48 @@ if __name__ == "__main__":
                                                 len(tr_loader), 
                                                 len(tr_loader)*num_epochs)
     
-    # Training loop
-    for epoch in range(num_epochs):
-        # Training
-        model.train()
-        running_loss = 0.0
-        correct_pred = 0
-        total_pred = 0
-        with tqdm(total=len(tr_loader)) as pbar:
-            for i, (inputs, targets) in enumerate(tr_loader):
-                # Move tensors to the correct device
-                inputs, targets = inputs.to(device), targets.to(device)
+    if args.ckpt is None or not os.path.exists(args.ckpt):
+        # Training loop
+        for epoch in range(num_epochs):
+            # Training
+            model.train()
+            running_loss = 0.0
+            correct_pred = 0
+            total_pred = 0
+            with tqdm(total=len(tr_loader)) as pbar:
+                for i, (inputs, targets) in enumerate(tr_loader):
+                    # Move tensors to the correct device
+                    inputs, targets = inputs.to(device), targets.to(device)
     
-                # Forward pass
-                outputs = model(inputs)
-                loss = criterion(outputs, targets)
-                logits = torch.sigmoid(outputs) >= 0.5
-                correct_pred += (logits == targets).sum().item()
-                total_pred += targets.size(0)
+                    # Forward pass
+                    outputs = model(inputs)
+                    loss = criterion(outputs, targets)
+                    logits = torch.sigmoid(outputs) >= 0.5
+                    correct_pred += (logits == targets).sum().item()
+                    total_pred += targets.size(0)
     
-                # Backward pass and optimization
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
-                scheduler.step()
+                    # Backward pass and optimization
+                    optimizer.zero_grad()
+                    loss.backward()
+                    optimizer.step()
+                    scheduler.step()
     
-                running_loss += loss.item()
-                pbar.set_description(f'Epoch {epoch+1}')
-                pbar.set_postfix({'loss': running_loss / (i+1), 
-                                  'acc': correct_pred / total_pred})
-                pbar.update(1)
+                    running_loss += loss.item()
+                    pbar.set_description(f'Epoch {epoch+1}')
+                    pbar.set_postfix({'loss': running_loss / (i+1), 
+                                      'acc': correct_pred / total_pred})
+                    pbar.update(1)
+                    
+        if not args.ckpt is None:
+            # Save the model
+            torch.save({
+                'model_state_dict': model.state_dict(),
+                'dim': tr_dataset.inputs.shape[-1],
+                }, args.ckpt)
+    else:
+        print(f"Resuming from checkpoint: {args.ckpt}")
+        checkpoint = torch.load(args.ckpt)
+        model.load_state_dict(checkpoint['model_state_dict'])
                 
     # Put the model in evaluation mode
     model.eval()

@@ -2,22 +2,17 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
-from torch import Tensor
 import numpy as np
-import math
 import os
 from os.path import join
-import pickle as pkl
 from tqdm import tqdm
 import transformers
-import scipy
 import json
 import time
 import argparse
 from torch.utils.data import DataLoader
 
 from utils.nets.transdfnet import DFNet
-from utils.nets.espressonet import EspressoNet
 from utils.layers import Mlp
 from utils.processor import DataProcessor
 from utils.data import *
@@ -69,7 +64,7 @@ def parse_args():
                         help = "Use online semi-hard triplet mining.")
     parser.add_argument('--loss_margin', default=0.1, type=float,
                         help = "Loss margin for triplet learning.")
-    parser.add_argument('--w', default=0.1,
+    parser.add_argument('--w', default=0.0,
                         help = "Weight placed on the chain-loss of multi-task loss.")
 
     # Model architecture options
@@ -140,7 +135,6 @@ if __name__ == "__main__":
                 'input_size': 1200,
                 'feature_dim': 64,
                 'stage_count': 3,
-                #'channel_up_factor': 24,
                 "features": [
                     "iats", 
                     "sizes", 
@@ -152,24 +146,24 @@ if __name__ == "__main__":
                 #     'window_overlap': 0,
                 #     "include_all_window": True,
                 #     },
-                "features": [
-                    "interval_dirs_up", 
-                    "interval_dirs_down", 
-                    "interval_dirs_sum",
-                    "interval_dirs_sub",
-                    ],
-                #"window_kwargs": {
-                #     'window_count': 12, 
-                #     'window_width': 6, 
-                #     'window_overlap': 2,
-                #     "include_all_window": True,
-                #     },
+                #"features": [
+                #    "interval_dirs_up", 
+                #    "interval_dirs_down", 
+                #    "interval_dirs_sum",
+                #    "interval_dirs_sub",
+                #    ],
                 "window_kwargs": {
-                     'window_count': 1, 
-                     'window_width': 0, 
-                     'window_overlap': 0,
+                     'window_count': 12, 
+                     'window_width': 6, 
+                     'window_overlap': 2,
                      "include_all_window": True,
                      },
+                #"window_kwargs": {
+                #     'window_count': 1, 
+                #     'window_width': 0, 
+                #     'window_overlap': 0,
+                #     "include_all_window": True,
+                #     },
             }
 
     if args.input_size is not None:
@@ -238,7 +232,7 @@ if __name__ == "__main__":
         dataset = BaseDataset(pklpath, processor,
                             window_kwargs = window_kwargs,
                             #preproc_feats = False,
-                            preproc_feats = True,
+                            preproc_feats = False,
                             sample_idx = idx,
                             **kwargs,
                             )
@@ -246,7 +240,7 @@ if __name__ == "__main__":
             dataset = OnlineDataset(dataset, k=2)
 
         else:
-            dataset = TripletDataset(dataset)
+            dataset = OfflineDataset(dataset)
         loader = DataLoader(dataset,
                             batch_size=mini_batch_size, 
                             collate_fn=dataset.batchify,
@@ -308,8 +302,7 @@ if __name__ == "__main__":
     #criterion = nn.MSELoss()
     criterion = nn.SmoothL1Loss(beta=1.0)
     if args.online:
-        triplet_criterion = OnlineCosineTripletLoss(margin=loss_margin,
-                                                    semihard=False)
+        triplet_criterion = OnlineCosineTripletLoss(margin=loss_margin)
     else:
         triplet_criterion = CosineTripletLoss(margin=loss_margin)
 
@@ -341,8 +334,12 @@ if __name__ == "__main__":
                     targets = targets.to(device)
 
                     embed = fen(inputs)
-
-                    triplet_loss = triplet_criterion(embed, labels)
+                    
+                    #correlated_pairs = labels == labels
+                    
+                    triplet_loss_f = triplet_criterion(embed, labels)
+                   # triplet_loss_f = triplet_criterion(inflow_embed, outflow_embed)
+                    triplet_loss =  torch.sum(triplet_loss_f) / (torch.count_nonzero(triplet_loss_f) + 1e-6)
                     trip_loss += triplet_loss.item()
 
                     pred = head(embed)
@@ -362,7 +359,8 @@ if __name__ == "__main__":
                     anc_embed = fen(inputs_anc)
                     pos_embed = fen(inputs_pos)
                     neg_embed = fen(inputs_neg)
-                    triplet_loss = triplet_criterion(anc_embed, pos_embed, neg_embed)
+                    triplet_loss_f = triplet_criterion(anc_embed, pos_embed, neg_embed)
+                    triplet_loss =  torch.sum(triplet_loss_f) / (torch.count_nonzero(triplet_loss_f) + 1e-6)
                     trip_loss += triplet_loss.item()
 
                     # # # # #
@@ -450,12 +448,21 @@ if __name__ == "__main__":
                 # save last checkpoint before restart
                 checkpoint_path_epoch = f"{checkpoint_dir}/{checkpoint_fname}/e{epoch}.pth"
                 print(f"Saving end-of-cycle checkpoint to {checkpoint_path_epoch}...")
+                #torch.save({
+                #                "epoch": epoch,
+                #                "fen": fen.state_dict(),
+                #                "chain_head": head.state_dict(),
+                #                "opt": optimizer.state_dict(),
+                #                "config": model_config,
+                #        }, checkpoint_path_epoch)
                 torch.save({
                                 "epoch": epoch,
-                                "fen": fen.state_dict(),
+                                "inflow_fen": fen.state_dict(),
+                                "outflow_fen": None,
                                 "chain_head": head.state_dict(),
                                 "opt": optimizer.state_dict(),
                                 "config": model_config,
+                                #"train_config": train_params,
                         }, checkpoint_path_epoch)
 
             if save_best_epoch:
@@ -463,12 +470,21 @@ if __name__ == "__main__":
                 if metrics['va_loss'] < best_val_loss:
                     checkpoint_path_epoch = f"{checkpoint_dir}/{checkpoint_fname}/best.pth"
                     print(f"Saving new best model to {checkpoint_path_epoch}...")
+                    #torch.save({
+                    #                "epoch": epoch,
+                    #                "fen": fen.state_dict(),
+                    #                "chain_head": head.state_dict(),
+                    #                "opt": optimizer.state_dict(),
+                    #                "config": model_config,
+                    #        }, checkpoint_path_epoch)
                     torch.save({
                                     "epoch": epoch,
-                                    "fen": fen.state_dict(),
+                                    "inflow_fen": fen.state_dict(),
+                                    "outflow_fen": None,
                                     "chain_head": head.state_dict(),
                                     "opt": optimizer.state_dict(),
                                     "config": model_config,
+                                    #"train_config": train_params,
                             }, checkpoint_path_epoch)
 
 

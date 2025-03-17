@@ -41,7 +41,7 @@ def collate_and_pad(batch):
     """
     # convert labels to tensor and get sequence lengths
     batch_windows, batch_chainlengths, batch_ids = zip(*batch)
-    batch_x = [windows[0] for windows in batch_windows]
+    batch_x = [torch.tensor(windows[0]) for windows in batch_windows]
     batch_y = [chainlength for chainlength in batch_chainlengths]
 
     batch_y = torch.tensor(batch_y)
@@ -55,14 +55,54 @@ def collate_and_pad(batch):
     return batch_x.float(), batch_y.long(),
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(
+                        #prog = 'WF Benchmark',
+                        #description = 'Train & evaluate WF attack model.',
+                        #epilog = 'Text at the bottom of help'
+                    )
+
+    # Main experiment configuration options
+    parser.add_argument('--data', required = True, type = str,
+                        help = "Path to dataset pickle file.",
+                    )
+    parser.add_argument('--ckpt_dir',
+                        default = './checkpoint', type = str,
+                        help = "Set directory for model checkpoints."
+                    )
+    parser.add_argument('--cache_dir',
+                        default = './cache', type = str,
+                        help = "Directory to use to store cached feature files."
+                    )
+    parser.add_argument('--results_dir', 
+                        default = './results',type = str,
+                        help = "Set directory for result logs."
+                    )
+    parser.add_argument('--ckpt', 
+                        default = None, type = str,
+                        help = "Resume from checkpoint path."
+                    )
+    parser.add_argument('--exp_name',
+                        type = str,
+                        default = f'{time.strftime("%Y%m%d-%H%M%S")}',
+                        help = ""
+                    )
+    parser.add_argument('--ckpt_epoch',
+                        type=int,
+                        default=10)
+    
+    return parser.parse_args()
+
 
 if __name__ == "__main__":
     """
     """
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
+    args = parse_args()
+
     # load checkpoint (if it exists)
-    checkpoint_path = None
+    checkpoint_path = args.ckpt
     checkpoint_fname = None
     resumed = None
     if checkpoint_path and os.path.exists(checkpoint_path):
@@ -72,8 +112,8 @@ if __name__ == "__main__":
     # else: checkpoint path and fname will be defined later if missing
 
     model_name = "DF"
-    checkpoint_dir = './ckpt'
-    results_dir = './res'
+    checkpoint_dir = args.ckpt_dir
+    results_dir = args.results_dir
     eval_only = False
 
     # # # # # #
@@ -83,9 +123,9 @@ if __name__ == "__main__":
     batch_size = 64        # when to update model
     accum = batch_size // mini_batch_size
     # # # # # #
-    warmup_period   = 5
-    ckpt_period     = 5
-    epochs          = 30
+    warmup_period   = args.ckpt_epoch
+    ckpt_period     = args.ckpt_epoch
+    epochs          = 20*ckpt_period
     opt_lr          = 15e-4
     opt_betas       = (0.9, 0.999)
     opt_wd          = 0.01
@@ -132,8 +172,7 @@ if __name__ == "__main__":
     # # # # # #
     # create data loaders
     # # # # # #
-    pklpath = '../data/ssh/processed_nov17_fixtime.pkl'
-    #pklpath = '../data/ssh_socat/processed_nov30.pkl'
+    pklpath = args.data
 
     # chain-based sample splitting
     te_idx = np.arange(0,1000)
@@ -148,8 +187,11 @@ if __name__ == "__main__":
                         window_kwargs = None,
                         preproc_feats = True,
                         sample_idx = tr_idx,
-                        host_only = True)
-                        #stream_ID_range = (1,float('inf')))
+                        stream_ID_range = (1,float('inf')),
+                        zero_time=True
+                        )
+                        #host_only = True
+                        #stream_ID_range = (1,float('inf'))
                         #stream_ID_range = (1,2))
                         #stream_ID_range = (-3,-2))
     trainloader = DataLoader(tr_data,
@@ -160,8 +202,10 @@ if __name__ == "__main__":
                         window_kwargs = None,
                         preproc_feats = True,
                         sample_idx = te_idx,
-                        host_only = True)
-                        #stream_ID_range = (1,float('inf')))
+                        stream_ID_range = (1,float('inf')),
+                        zero_time=True
+                        )
+                        #host_only = True
                         #stream_ID_range = (1,2))
                         #stream_ID_range = (-3,-2))
     testloader = DataLoader(te_data, 

@@ -18,6 +18,7 @@ from utils.nets.espressonet import EspressoNet
 from utils.nets.dcfnet import Conv1DModel
 from utils.layers import Mlp
 from utils.processor import DataProcessor
+from utils.data import build_dataset, TripletDataset, OnlineTripletDataset
 from utils.data import *
 from utils.loss import *
 
@@ -31,93 +32,6 @@ torch.autograd.profiler.emit_nvtx(False)
 
 # auto-optimize cudnn ops
 torch.backends.cudnn.benchmark = True
-
-class TripletDataset(Dataset):
-    def __init__(self, inflow_data, outflow_data, chain_targets):
-        self.positive_top = True
-        self.inflow_data = inflow_data
-        self.outflow_data = outflow_data
-        self.all_indices = list(range(len(self.inflow_data)))
-        random.shuffle(self.all_indices)
-        self.chain_targets = chain_targets
-
-        # Divide the shuffled indices into two partitions
-        cutoff = len(self.all_indices) // 2
-        self.partition_1 = self.all_indices[:cutoff]
-        self.partition_2 = self.all_indices[cutoff:]
-
-    def __len__(self):
-        return len(self.inflow_data)
-
-    def __getitem__(self, idx):
-        # Choose a positive from partition 1 and a negative from partition 2 (or vice versa)
-        if self.positive_top:
-            idx = random.choice(self.partition_1)
-            negative_idx = random.choice([j for j in self.partition_2 if j != idx])
-        else:
-            idx = random.choice(self.partition_2)
-            negative_idx = random.choice([j for j in self.partition_1 if j != idx])
-
-        anchor = self.inflow_data[idx]
-        positive = self.outflow_data[idx]
-        target = self.chain_targets[idx]
-        negative = self.outflow_data[negative_idx]
-
-        return (
-            torch.tensor(anchor, dtype=torch.float32),
-            torch.tensor(positive, dtype=torch.float32),
-            torch.tensor(negative, dtype=torch.float32),
-            torch.tensor(target, dtype=torch.float32),
-        )
-
-    def reset_split(self):
-        self.positive_top = not self.positive_top
-
-        # Reshuffle the indices at the start of each epoch
-        random.shuffle(self.all_indices)
-
-        # Re-divide the shuffled indices into two partitions
-        cutoff = len(self.all_indices) // 2
-        self.partition_1 = self.all_indices[:cutoff]
-        self.partition_2 = self.all_indices[cutoff:]
-
-
-class OnlineTripletDataset(Dataset):
-    def __init__(self, inflow_data, outflow_data, chain_targets):
-        self.positive_top = True
-        self.inflow_data = inflow_data
-        self.outflow_data = outflow_data
-        self.all_indices = list(range(len(self.inflow_data)))
-        random.shuffle(self.all_indices)
-        self.size = len(self.all_indices)
-        self.chain_targets = chain_targets
-
-    def __len__(self):
-        return len(self.inflow_data)
-
-    def __getitem__(self, trace_idx):
-        # Pick a random inflow, outflow pair
-        #trace_idx = torch.randint(low=0, high=self.size, size=(1,), dtype=torch.int32)
-        anchor = self.inflow_data[trace_idx]
-        positive = self.outflow_data[trace_idx]
-        target = self.chain_targets[trace_idx]
-
-        return (
-            torch.tensor(anchor, dtype=torch.float32),
-            torch.tensor(positive, dtype=torch.float32),
-            torch.tensor(target, dtype=torch.float32),
-        )
-
-    def reset_split(self):
-        self.positive_top = not self.positive_top
-
-        # Reshuffle the indices at the start of each epoch
-        random.shuffle(self.all_indices)
-
-        # Re-divide the shuffled indices into two partitions
-        cutoff = len(self.all_indices) // 2
-        self.partition_1 = self.all_indices[:cutoff]
-        self.partition_2 = self.all_indices[cutoff:]
 
 
 def parse_args():
@@ -225,8 +139,8 @@ if __name__ == "__main__":
     batch_size = 64   # samples to fit on GPU
     # # # # # #
     ckpt_period     = args.ckpt_epoch
-    epochs          = args.ckpt_epoch * 5
-    opt_lr          = 1e-4
+    epochs          = args.ckpt_epoch * 30
+    opt_lr          = 1e-3
     opt_betas       = (0.9, 0.999)
     opt_wd          = 0.001
     save_best_epoch = True
@@ -265,16 +179,17 @@ if __name__ == "__main__":
     processor = DataProcessor(features, **model_config)
     
     model_config['input_channels'] = processor.input_channels
-    #model_config['input_channels'] = 8
 
     print("==> Model configuration:")
     print(json.dumps(model_config, indent=4))
+    inflow_size = model_config.get('inflow_size', 1000)
+    outflow_size = model_config.get('outflow_size', 1000)
     
     model_arch = model_config['model']
     if model_arch.lower() == "espresso":
         inflow_fen = EspressoNet(**model_config)
     elif model_arch.lower() == 'dcf':
-        inflow_fen = Conv1DModel(input_size = model_config.get('inflow_size', 1000),
+        inflow_fen = Conv1DModel(input_size = inflow_size,
                                 **model_config)
     else:
         print(f"Invalid model architecture name \'{model_arch}\'!")
@@ -292,7 +207,7 @@ if __name__ == "__main__":
         if model_arch.lower() == "espresso":
             outflow_fen = EspressoNet(**model_config)
         elif model_arch.lower() == 'dcf':
-            outflow_fen = Conv1DModel(input_size = model_config.get('inflow_size', 1000),
+            outflow_fen = Conv1DModel(input_size = outflow_size,
                                     **model_config)
         outflow_fen = outflow_fen.to(device)
         params += outflow_fen.parameters()
@@ -300,7 +215,7 @@ if __name__ == "__main__":
     # chain length prediction head
     if multitask:
         in_dim = feature_dim * model_config.get('special_toks',1) * 2
-        head = Mlp(dim=in_dim, out_features=1)
+        head = Mlp(dim=in_dim, out_features=2)
         head = head.to(device)
         if resumed:
             head_state_dict = resumed['chain_head']
@@ -328,20 +243,33 @@ if __name__ == "__main__":
     va_idx = idx[500:1000]
     tr_idx = idx[1000:10000]
     
-    def build_dataset(pklpath, processor, in_idx=1, out_idx=-1):
-        chains = load_dataset(pklpath)#, sample_idx)
-        inflow, outflow = [],[]
-        targets = []
-        for chain in tqdm(chains):
-            targets.append(len(chain)-3)
-            s1 = processor(chain[in_idx])#.numpy(force=True)
-            s2 = processor(chain[out_idx])#.numpy(force=True)
-            inflow.append(s1)
-            outflow.append(s2)
-        inflow = np.stack(inflow)#.transpose((0,2,1))
-        outflow = np.stack(outflow)#.transpose((0,2,1))
-        targets = np.array(targets)
-        return inflow, outflow, targets
+    #def build_dataset(pklpath, processor, in_idx=1):
+    #    chains = load_dataset(pklpath)#, sample_idx)
+    #    inflow, outflow = [],[]
+    #    targets = []
+    #    for i,chain in tqdm(enumerate(chains), total=10000):
+    #        targets.append(len(chain)-2)
+    #        s1 = processor(chain[in_idx])
+    #        s2 = [processor(chain[j]) for j in range(in_idx,len(chain))]
+    #        
+    #        if len(s1) < inflow_size:
+    #            s1 = np.pad(s1, ((0,inflow_size-len(s1)),(0,0)))
+    #        else:
+    #            s1 = s1[:inflow_size]
+    #        for j in range(len(s2)):
+    #            if len(s2[j]) < outflow_size:
+    #                s2[j] = np.pad(s2[j], ((0,outflow_size-len(s2[j])),(0,0)))
+    #            else:
+    #                s2[j] = s2[j][:outflow_size]
+    #            
+    #        if i >= 10000: break
+    #            
+    #        inflow.append(s1)
+    #        outflow.append(s2)
+    #    inflow = np.stack(inflow).transpose((0,2,1))
+    #    outflow = np.stack(outflow).transpose((0,1,3,2))
+    #    targets = np.array(targets)
+    #    return inflow, outflow, targets
     
     if args.host:
         out_idx = 2
@@ -349,7 +277,7 @@ if __name__ == "__main__":
     else:
         out_idx = -1
         in_idx = 1
-    inflow, outflow, targets = build_dataset(pklpath, processor, out_idx=out_idx, in_idx=in_idx)
+    inflow, outflow, targets = build_dataset(pklpath, processor, inflow_size, outflow_size, in_idx=in_idx)
     #tr_inflow, tr_outflow, tr_targets = build_dataset(pklpath, processor, tr_idx)
     va_inflow = inflow[va_idx]
     va_outflow = outflow[va_idx]
@@ -446,24 +374,24 @@ if __name__ == "__main__":
     last_epoch = -1
     if resumed and resumed['epoch']:    # if resuming from a finetuning checkpoint
         last_epoch = resumed['epoch']
-    #scheduler = StepLR(optimizer, 
-    #                    step_size = ckpt_period * 2, 
-    #                    gamma = 0.7,
-    #                    last_epoch=last_epoch
-    #                )
-    def lr_lambda(current_epoch, warmup_epochs=10):
-        if current_epoch < warmup_epochs:
-            return float(current_epoch + 1) / float(warmup_epochs)
-        else:
-            return 0.5 * (
-                1
-                + math.cos(
-                    math.pi
-                    * (current_epoch - warmup_epochs)
-                    / (epochs - warmup_epochs)
-                )
-            )
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
+    scheduler = StepLR(optimizer, 
+                        step_size = ckpt_period * 2, 
+                        gamma = 0.7,
+                        last_epoch=last_epoch
+                    )
+    #def lr_lambda(current_epoch, warmup_epochs=10):
+    #    if current_epoch < warmup_epochs:
+    #        return float(current_epoch + 1) / float(warmup_epochs)
+    #    else:
+    #        return 0.5 * (
+    #            1
+    #            + math.cos(
+    #                math.pi
+    #                * (current_epoch - warmup_epochs)
+    #                / (epochs - warmup_epochs)
+    #            )
+    #        )
+    #scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
 
     # define checkpoint fname if not provided
     if not checkpoint_fname:
@@ -657,7 +585,8 @@ if __name__ == "__main__":
 
                     #acc = (up_acc + down_acc)/2
                     length_pred = torch.round(pred)
-                    acc += torch.sum(length_pred.flatten() == targets.flatten()).item()
+                    up_acc += torch.sum(length_pred[:,0].flatten() == targets[:,0].flatten()).item()
+                    down_acc += torch.sum(length_pred[:,1].flatten() == targets[:,1].flatten()).item()
                 # # # # #
 
                 n += len(targets)
@@ -674,9 +603,8 @@ if __name__ == "__main__":
                         }
                 if loss_delta > 0.:
                     postfix.update({
-                            #'up_acc': up_acc/n,
-                            #'down_acc': down_acc/n,
-                            'acc': acc/n,
+                            'up_acc': up_acc/n,
+                            'down_acc': down_acc/n,
                             'tot_loss': tot_loss/(batch_idx+1),
                     })
                 if args.temporal_alignment:
@@ -692,15 +620,15 @@ if __name__ == "__main__":
                     mod_desc = desc
                 pbar.set_description(mod_desc)
                 
-            if args.online:
-                sims = compute_sim(inflow_embed, outflow_embed, mean=False)
-                sims = sims.permute(1,2,0).reshape(-1, sims.size(0))
-                print(sims[0])
-                sims = compute_sim(inflow_embed.permute(0,2,1), outflow_embed.permute(0,2,1), mean=False)
-                sims = sims.permute(1,2,0).reshape(-1, sims.size(0))
-                print(sims[0])
+            #if args.online:
+            #    sims = compute_sim(inflow_embed, outflow_embed, mean=False)
+            #    sims = sims.permute(1,2,0).reshape(-1, sims.size(0))
+            #    print(sims[0])
+            #    sims = compute_sim(inflow_embed.permute(0,2,1), outflow_embed.permute(0,2,1), mean=False)
+            #    sims = sims.permute(1,2,0).reshape(-1, sims.size(0))
+            #    print(sims[0])
 
-                #print(pred)
+            #    #print(pred)
 
                 
         trip_loss /= batch_idx + 1

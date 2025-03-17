@@ -11,6 +11,132 @@ import hashlib
 import os
 from os.path import join, exists
 
+# Hack in istarmap to multiprocessing for Python 3.8+
+import multiprocessing.pool as mpp
+from multiprocessing import cpu_count
+
+def istarmap(self, func, iterable, chunksize=1):
+    """starmap-version of imap
+    """
+    self._check_running()
+    if chunksize < 1:
+        raise ValueError(
+            "Chunksize must be 1+, not {0:n}".format(
+                chunksize))
+
+    task_batches = mpp.Pool._get_tasks(func, iterable, chunksize)
+    result = mpp.IMapIterator(self)
+    self._taskqueue.put(
+        (
+            self._guarded_task_generation(result._job,
+                                          mpp.starmapstar,
+                                          task_batches),
+            result._set_length
+        ))
+    return (item for chunk in result for item in chunk)
+
+mpp.Pool.istarmap = istarmap
+
+
+class TripletDataset(data.Dataset):
+    def __init__(self, inflow_data, outflow_data, chain_targets):
+        self.positive_top = True
+        self.inflow_data = inflow_data
+        self.outflow_data = outflow_data
+        self.all_indices = list(range(len(self.inflow_data)))
+        random.shuffle(self.all_indices)
+        self.chain_targets = chain_targets
+
+        # Divide the shuffled indices into two partitions
+        cutoff = len(self.all_indices) // 2
+        self.partition_1 = self.all_indices[:cutoff]
+        self.partition_2 = self.all_indices[cutoff:]
+
+    def __len__(self):
+        return len(self.inflow_data)
+
+    def __getitem__(self, idx):
+        # Choose a positive from partition 1 and a negative from partition 2 (or vice versa)
+        if self.positive_top:
+            idx = random.choice(self.partition_1)
+            negative_idx = random.choice([j for j in self.partition_2 if j != idx])
+        else:
+            idx = random.choice(self.partition_2)
+            negative_idx = random.choice([j for j in self.partition_1 if j != idx])
+
+        anchor = self.inflow_data[idx]
+        
+        sample_idx = torch.randint(low=0, high=len(self.outflow_data[idx]), size=(1,), dtype=torch.int32)
+        positive = self.outflow_data[idx][sample_idx]
+        
+        sample_idx = torch.randint(low=0, high=len(self.outflow_data[negative_idx]), size=(1,), dtype=torch.int32)
+        negative = self.outflow_data[negative_idx][sample_idx]
+        
+        target = torch.tensor([sample_idx, len(self.outflow_data[negative_idx])-sample_idx], dtype=torch.float32) 
+        
+        #positive = self.outflow_data[idx]
+        #target = self.chain_targets[idx]
+        #negative = self.outflow_data[negative_idx]
+
+        return (
+            torch.tensor(anchor, dtype=torch.float32),
+            torch.tensor(positive, dtype=torch.float32),
+            torch.tensor(negative, dtype=torch.float32),
+            target,
+        )
+
+    def reset_split(self):
+        self.positive_top = not self.positive_top
+
+        # Reshuffle the indices at the start of each epoch
+        random.shuffle(self.all_indices)
+
+        # Re-divide the shuffled indices into two partitions
+        cutoff = len(self.all_indices) // 2
+        self.partition_1 = self.all_indices[:cutoff]
+        self.partition_2 = self.all_indices[cutoff:]
+
+
+class OnlineTripletDataset(data.Dataset):
+    def __init__(self, inflow_data, outflow_data, chain_targets):
+        self.positive_top = True
+        self.inflow_data = inflow_data
+        self.outflow_data = outflow_data
+        self.all_indices = list(range(len(self.inflow_data)))
+        random.shuffle(self.all_indices)
+        self.size = len(self.all_indices)
+        self.chain_targets = chain_targets
+
+    def __len__(self):
+        return len(self.inflow_data)
+
+    def __getitem__(self, trace_idx):
+        # Pick a random inflow, outflow pair
+        #trace_idx = torch.randint(low=0, high=self.size, size=(1,), dtype=torch.int32)
+        anchor = self.inflow_data[trace_idx]
+        
+        sample_idx = torch.randint(low=0, high=len(self.outflow_data[trace_idx]), size=(1,), dtype=torch.int32)
+        positive = self.outflow_data[trace_idx][sample_idx]
+        target = torch.tensor([sample_idx, len(self.outflow_data[trace_idx])-sample_idx], dtype=torch.float32) 
+        #self.chain_targets[trace_idx]
+
+        return (
+            torch.tensor(anchor, dtype=torch.float32),
+            torch.tensor(positive, dtype=torch.float32),
+            target,
+        )
+
+    def reset_split(self):
+        self.positive_top = not self.positive_top
+
+        # Reshuffle the indices at the start of each epoch
+        random.shuffle(self.all_indices)
+
+        # Re-divide the shuffled indices into two partitions
+        cutoff = len(self.all_indices) // 2
+        self.partition_1 = self.all_indices[:cutoff]
+        self.partition_2 = self.all_indices[cutoff:]
+
 
 PROTO_MAP = {'ssh': 0, 'socat': 1, 'icmp': 2, 'dns': 3}
 
@@ -65,6 +191,7 @@ class BaseDataset(data.Dataset):
                        host_only = False,
                        preproc_feats = False,
                        save_to_dir = None,
+                       zero_time = False,
                     ):
         """
         Load the metadata for samples collected in our SSID data. 
@@ -122,7 +249,7 @@ class BaseDataset(data.Dataset):
 
             # load and enumeratechains in the dataset
             #chains, protocols = load_dataset(filepath, sample_idx)
-            chains = load_dataset(filepath, sample_idx)
+            chains = load_dataset(filepath, sample_idx, zero_time=zero_time)
             for chain_ID, chain in tqdm(enumerate(chains)):
 
                 # total hops in chain
@@ -156,7 +283,7 @@ class BaseDataset(data.Dataset):
                         # time-only representation
                         times = times_processor(stream)
 
-                        windows = create_windows(times, stream, **window_kwargs)
+                        windows = create_windows(times, stream, adjust_times=not preproc_feats, **window_kwargs)
 
                         if not preproc_feats:
                             # create multi-channel feature representation of windows independently
@@ -181,6 +308,10 @@ class BaseDataset(data.Dataset):
 
                 if len(stream_ID_list) > 1:
                     self.data_chain_IDs[chain_ID] = stream_ID_list
+                    
+            # convert all numpy arrays to torch tensors
+            #self.data_windows = {k: [torch.tensor(x) for x in v] for k,v in self.data_windows.items()}
+            #self.data_chainlengths = {k: torch.tensor(v) for k,v in self.data_chainlengths.items()}
 
             if save_to_dir is not None:
                 if not exists(save_to_dir):
@@ -300,13 +431,15 @@ class PairwiseDataset(BaseDataset):
 
             if sample_mode == 'oversample':
                 k = int(len(self.uncorrelated_pairs) * sample_ratio)
-                idx = random.choice(np.arange(len(self.correlated_pairs)), size=k, replace=False)
+                idx = random.choice(np.arange(len(self.correlated_pairs)), 
+                                    size=k, replace=False)
                 self.correlated_pairs = np.array(self.correlated_pairs, dtype=object)[idx]
                 self.uncorrelated_pairs = np.array(self.uncorrelated_pairs, dtype=object)
 
             elif sample_mode == 'undersample':
                 k = int(len(self.correlated_pairs) * sample_ratio)
-                idx = random.choice(np.arange(len(self.uncorrelated_pairs)), size=k, replace=False)
+                idx = random.choice(np.arange(len(self.uncorrelated_pairs)), 
+                                    size=k, replace=False)
                 self.uncorrelated_pairs = np.array(self.uncorrelated_pairs, dtype=object)[idx]
                 self.correlated_pairs = np.array(self.correlated_pairs, dtype=object)
 
@@ -376,7 +509,7 @@ class PairwiseDataset(BaseDataset):
         return sample1, sample2, correlated
 
 
-class TripletDataset(BaseDataset):
+class OfflineDataset(BaseDataset):
     """
     Dataset object for generating triplets for triplet learning.
     """
@@ -509,7 +642,7 @@ class TripletDataset(BaseDataset):
         # pad and fix dimension
         batch_x_tensors = []
         for batch_x_n in batch_x:
-            batch_x_n = torch.nn.utils.rnn.pad_sequence(batch_x_n, batch_first=True, padding_value=0.)
+            batch_x_n = torch.nn.utils.rnn.pad_sequence([torch.tensor(x) for x in batch_x_n], batch_first=True, padding_value=0.)
             if len(batch_x_n.shape) < 3:  # add channel dimension if missing
                 batch_x_n = batch_x_n.unsqueeze(-1)
             batch_x_n = batch_x_n.permute(0,2,1)
@@ -593,10 +726,16 @@ class OnlineDataset(BaseDataset):
         # pick a random window to return
         window_count = len(batch_x[0])
         window_idx = np.random.choice(range(window_count))
-        batch_x = [x[window_idx] for x in batch_x]
+        for i in range(len(batch_x)):
+            window = batch_x[i][window_idx]
+            while len(window) < 0:
+                new_idx = np.random.choice(range(window_count))
+                window = batch_x[i][new_idx]
+            batch_x[i] = window
+        #batch_x = [x[window_idx] for x in batch_x]
 
         # pad batches and fix dimension
-        batch_x_tensor = torch.nn.utils.rnn.pad_sequence(batch_x, 
+        batch_x_tensor = torch.nn.utils.rnn.pad_sequence([torch.tensor(x) for x in batch_x], 
                                                     batch_first = True, 
                                                     padding_value = 0.)
         batch_x_tensor = batch_x_tensor.permute(0,2,1)
@@ -612,7 +751,8 @@ def create_windows(times, features,
                     window_width = 5,
                     window_count = 11,
                     window_overlap = 2,
-                    include_all_window = True,
+                    include_all_window = False,
+                    adjust_times = True,
                 ):
     """
     Slice a sample's full stream into time-based windows.
@@ -635,17 +775,26 @@ def create_windows(times, features,
     if include_all_window:
         window_count -= 1
 
-    window_step = min(window_width - window_overlap, 1)
-
-    # Create overlapping windows
     if window_count > 0:
+        window_step = min(window_width - window_overlap, 1)
+
+        # Create overlapping windows
         for start in np.arange(0, stop = window_count * window_step, 
                                   step = window_step):
 
             end = start + window_width
 
-            window_idx = torch.where(torch.logical_and(times >= start, times < end))[0]
-            window_features.append(features[window_idx])
+            #window_idx = torch.where(torch.logical_and(times >= start, times < end))[0]
+            #window_features.append(features[window_idx])
+            # Find the indices for the current window range [start, end)
+            left_idx = np.searchsorted(times.squeeze(), start, side='left')
+            right_idx = np.searchsorted(times.squeeze(), end, side='left')
+            # Slice out the timestamps for this window
+            window = features[left_idx:right_idx]
+            
+            if adjust_times:
+                window[:,0] -= start
+            window_features.append(window)
 
     # add full stream as window
     if include_all_window:
@@ -653,7 +802,7 @@ def create_windows(times, features,
 
     return window_features
 
-def process(x):
+def process(x, zero_time=False):
     """
     Simple example function to use when processing 
     """
@@ -667,17 +816,21 @@ def process(x):
     packet_sizes =  packet_sizes[sorted_indices]
     directions = directions[sorted_indices]
 
-    iats = np.diff(timestamps)
-    iats = np.concatenate(([0], iats))
+    #iats = np.diff(timestamps)
+    #iats = np.concatenate(([0], iats))
 
-    output = [(t, d*s) for t,d,s in zip(timestamps, directions, packet_sizes)]
+    if zero_time:
+        t_min = np.amin(timestamps)
+    else:
+        t_min = 0
+    output = [(t-t_min, d*s) for t,d,s in zip(timestamps, directions, packet_sizes)]
 
-    output = sorted(output, key=lambda x: x[0])
+    output = np.array(sorted(output, key=lambda x: x[0]))
 
     return output
 
 
-def load_dataset(filepath, idx_selector=None):
+def load_dataset(filepath, idx_selector=None, zero_time=False):
     """
     Load the metadata for samples collected in our SSID data. 
 
@@ -707,8 +860,8 @@ def load_dataset(filepath, idx_selector=None):
 
     # list of all sample idx
     sample_IDs = sorted(list(data.keys()))   # sorted so that it is reliably ordered
-    #if idx_selector is not None:
-    #    sample_IDs = np.array(sample_IDs, dtype=object)[idx_selector].tolist()  # slice out requested idx
+    if idx_selector is not None:
+        sample_IDs = np.array(sample_IDs, dtype=object)[idx_selector].tolist()  # slice out requested idx
 
     # fill with lists of correlated samples
     all_streams = []
@@ -734,7 +887,7 @@ def load_dataset(filepath, idx_selector=None):
         stream_protocols = []
         for h_idx in host_IDs:
             #correlated_streams.extend([torch.tensor(x).T for x in sample[h_idx]])
-            correlated_streams.extend([process(x) for x in sample[h_idx]])
+            correlated_streams.extend([process(x, zero_time=zero_time) for x in sample[h_idx]])
             #stream_protocols.extend([PROTO_MAP[proto] for proto in protocols[h_idx]])
 
         # add group of correlated streams for the sample into the data list
@@ -742,6 +895,56 @@ def load_dataset(filepath, idx_selector=None):
         #all_protocols.append(stream_protocols)
 
     return all_streams#, all_protocols
+
+
+    
+# Helper function to process a single chain
+def process_chain(i, chain, in_idx, inflow_size, outflow_size, processor):
+    target = len(chain) - 2
+    s1 = processor(chain[in_idx])
+    s2 = [processor(chain[j]) for j in range(in_idx, len(chain))]
+
+    # Pad or trim s1 to match inflow_size
+    if len(s1) < inflow_size:
+        s1 = np.pad(s1, ((0, inflow_size - len(s1)), (0, 0)))
+    else:
+        s1 = s1[:inflow_size]
+
+    # Pad or trim each element in s2 to match outflow_size
+    for j in range(len(s2)):
+        if len(s2[j]) < outflow_size:
+            s2[j] = np.pad(s2[j], ((0, outflow_size - len(s2[j])), (0, 0)))
+        else:
+            s2[j] = s2[j][:outflow_size]
+
+    return s1, s2, target
+
+def build_dataset(pklpath, processor, inflow_size, outflow_size, in_idx=1, n_jobs=8):
+    # load_dataset must be defined elsewhere
+    chains = load_dataset(pklpath)
+
+    # Prepare arguments for each chain; limit to 10000 chains
+    tasks = []
+    for i, chain in enumerate(chains):
+        if i >= 10000:
+            break
+        tasks.append((i, chain, in_idx, inflow_size, outflow_size, processor))
+
+    # Process chains in parallel using a multiprocessing Pool
+    inflow, outflow, targets = [], [], []
+    with mpp.Pool(min(cpu_count(), n_jobs)) as pool:
+        for s1, s2, t in tqdm(pool.istarmap(process_chain, tasks, chunksize=16), 
+                              total = len(tasks)):
+            inflow.append(s1)
+            outflow.append(s2)
+            targets.append(t)
+
+    # Stack and transpose as needed
+    inflow = np.stack(inflow).transpose((0, 2, 1))
+    outflow = np.array([np.stack(samples).transpose((0, 2, 1)) for samples in outflow], dtype=object)
+    targets = np.array(targets)
+
+    return inflow, outflow, targets
 
 
 if __name__ == "__main__":

@@ -18,6 +18,31 @@ from utils.data import build_dataset
 from utils.processor import *
 
 
+# Hack in istarmap to multiprocessing for Python 3.8+
+import multiprocessing.pool as mpp
+from multiprocessing import cpu_count
+
+def istarmap(self, func, iterable, chunksize=1):
+    """starmap-version of imap
+    """
+    self._check_running()
+    if chunksize < 1:
+        raise ValueError(
+            "Chunksize must be 1+, not {0:n}".format(
+                chunksize))
+
+    task_batches = mpp.Pool._get_tasks(func, iterable, chunksize)
+    result = mpp.IMapIterator(self)
+    self._taskqueue.put(
+        (
+            self._guarded_task_generation(result._job,
+                                          mpp.starmapstar,
+                                          task_batches),
+            result._set_length
+        ))
+    return (item for chunk in result for item in chunk)
+
+mpp.Pool.istarmap = istarmap
 
 
 # enable if NaN or other odd behavior appears
@@ -220,7 +245,53 @@ if __name__ == "__main__":
     #    data_kwargs = {
     #            'stream_ID_range': (1,float('inf')),
     #            }
-        
+    
+    # Helper function to process a single chain
+    def process_chain(i, chain, size, processor):
+        target = len(chain) - 2
+        s = [processor(chain[j]) for j in range(1, len(chain)-1)]
+
+        # Pad or trim each element in s2 to match outflow_size
+        for j in range(len(s)):
+            if len(s[j]) < size:
+                s[j] = np.pad(s[j], ((0, size - len(s[j])), (0, 0)))
+            else:
+                s[j] = s[j][:size]
+
+        return s, target
+
+    def build_dataset(pklpath, processor, size, n_jobs=8):
+        # load_dataset must be defined elsewhere
+        chains = load_dataset(pklpath)
+
+        # Prepare arguments for each chain; limit to 10000 chains
+        tasks = []
+        for i, chain in enumerate(chains):
+            if i >= 10000:
+                break
+            tasks.append((i, chain, size, processor))
+
+        # Process chains in parallel using a multiprocessing Pool
+        flows, chain_id, host_id = [], [], []
+        j = 0
+        with mpp.Pool(min(cpu_count(), n_jobs)) as pool:
+            for s2, t in tqdm(pool.istarmap(process_chain, tasks, chunksize=16), 
+                                  total = len(tasks)):
+                flows.append(np.stack(s2).transpose((0,2,1)))
+                chain_id.append(np.ones(len(s2))*j)
+                host_id.append(np.arange(len(s2))//2)
+                j += 1
+                #targets.append(t)
+
+        # Stack and transpose as needed
+        #flows = np.array([np.stack(samples).transpose((0, 2, 1)) for samples in flows], dtype=object)
+        #flows = np.stack(flows).transpose((0, 2, 1))
+        #targets = np.array(targets)
+
+        return np.array(flows,dtype=object), np.array(chain_id,dtype=object), np.array(host_id,dtype=object)
+
+    flows, chain_id, host_id = build_dataset(pklpath, processor, max(inflow_size, outflow_size))
+    
     idx = np.arange(0,10000)
     np.random.seed(42)
     np.random.shuffle(idx)
@@ -228,53 +299,19 @@ if __name__ == "__main__":
     va_idx = idx[500:1000]
     tr_idx = idx[1000:10000]
     
-    if args.host:
-        out_idx = 2
-        in_idx = 1
-    else:
-        out_idx = -1
-        in_idx = 1
-    inflow, outflow, targets = build_dataset(pklpath, processor, 
-                                             inflow_size, outflow_size, 
-                                             in_idx = in_idx)
-    outflow = np.array([x[out_idx] for x in outflow])
-    va_inflow = inflow[va_idx]
-    va_outflow = outflow[va_idx]
-    te_inflow = inflow[te_idx]
-    te_outflow = outflow[te_idx]
-    print(va_inflow.shape, va_outflow.shape)
-    print(te_inflow.shape, te_outflow.shape)
+    va_chain_flows = flows[va_idx].tolist()
+    va_chain_labels = chain_id[va_idx].tolist()
+    va_host_labels = host_id[va_idx].tolist()
+    te_chain_flows = flows[te_idx].tolist()
+    te_chain_labels = chain_id[te_idx].tolist()
+    te_host_labels = host_id[te_idx].tolist()
     
-    """
-    # train dataloader
-    va_data = BaseDataset(pklpath, processor,
-                        window_kwargs = window_kwargs,
-                        preproc_feats = False,
-                        sample_idx = va_idx,
-                        save_to_dir = args.cache_dir,
-                        **data_kwargs
-                        )
-    va_data = PairwiseDataset(va_data)
-    va_ratio = len(va_data.uncorrelated_pairs) / len(va_data.correlated_pairs)
-    print(f'Tr. data ratio: {va_ratio}')
-
-    # test dataloader
-    te_data = BaseDataset(pklpath, processor,
-                        window_kwargs = window_kwargs,
-                        preproc_feats = False,
-                        sample_idx = te_idx,
-                        save_to_dir = args.cache_dir,
-                        **data_kwargs
-                        )
-    te_data = PairwiseDataset(te_data)
-    te_ratio = len(te_data.uncorrelated_pairs) / len(te_data.correlated_pairs)
-    print(f'Te. data ratio: {te_ratio}', 
-          len(te_data.uncorrelated_pairs), 
-          len(te_data.correlated_pairs))
-    """
-    
-    """
-    """
+    va_chain_flows = np.concatenate(va_chain_flows)
+    te_chain_flows = np.concatenate(te_chain_flows)
+    va_chain_labels = np.concatenate(va_chain_labels)
+    te_chain_labels = np.concatenate(te_chain_labels)
+    va_host_labels = np.concatenate(va_host_labels)
+    te_host_labels = np.concatenate(te_host_labels)
     
     # generate embeddings
     def func(t):
@@ -306,11 +343,8 @@ if __name__ == "__main__":
     #        outflow_embeds.append(fen(func(sample2[0][0])).detach().cpu()[0])
     #    return inflow_embeds, outflow_embeds
     
-    va_inflow_embeds, va_outflow_embeds = make_embeds(va_inflow, inflow_fen), make_embeds(va_outflow, outflow_fen)
-    print(len(va_inflow_embeds), len(va_outflow_embeds))
-    te_inflow_embeds, te_outflow_embeds = make_embeds(te_inflow, inflow_fen), make_embeds(te_outflow, outflow_fen)
-    #va_inflow_embeds, va_outflow_embeds = make_embeds(va_data, outflow_fen)
-    #te_inflow_embeds, te_outflow_embeds = make_embeds(te_data, outflow_fen)
+    va_inflow_embeds, va_outflow_embeds = make_embeds(va_chain_flows, inflow_fen), make_embeds(va_chain_flows, outflow_fen)
+    te_inflow_embeds, te_outflow_embeds = make_embeds(te_chain_flows, inflow_fen), make_embeds(te_chain_flows, outflow_fen)
 
     #def build_sims(dataset):
     def build_sims(inflow_embeds, outflow_embeds):
@@ -319,45 +353,8 @@ if __name__ == "__main__":
         """
         sims = []
             
-        #print(np.mean(avg_corr), np.mean(avg_uncorr))
         inflow_embeds = torch.stack(inflow_embeds)
         outflow_embeds = torch.stack(outflow_embeds)
-        
-        # Normalize embeddings
-        #inflow_embeddings_norm = inflow_embeds / inflow_embeds.norm(dim=-1, keepdim=True)
-        #outflow_embeddings_norm = outflow_embeds / outflow_embeds.norm(dim=-1, keepdim=True)
-
-        # Compute cosine similarities in batch
-        # Resulting shape: [num_inflows, num_outflows, 92]
-        #similarities = torch.einsum('ikd,jkd->ijk', 
-        #                            inflow_embeddings_norm, 
-        #                            outflow_embeddings_norm)
-        #similarities = similarities.reshape((-1, similarities.shape[-1]))
-        
-        
-        #"""
-        #"""
-        #inflow_embeds = inflow_embeds.permute(0,2,1)
-        #outflow_embeds = outflow_embeds.permute(0,2,1)
-        #inflow_embeddings_norm = inflow_embeds / inflow_embeds.norm(dim=-1, keepdim=True)
-        #outflow_embeddings_norm = outflow_embeds / outflow_embeds.norm(dim=-1, keepdim=True)
-        
-        #similarities2 = torch.einsum('ikd,jkd->ijk', 
-        #                            inflow_embeddings_norm, 
-        #                            outflow_embeddings_norm)
-        #similarities2 = similarities2.reshape((-1, similarities2.shape[-1]))
-        #similarities = torch.cat((similarities, similarities2), dim=1)
-        
-        #num_inflows = inflow_embeddings_norm.shape[0]
-        #num_outflows = outflow_embeddings_norm.shape[0]
-        #inflow_indices = torch.arange(num_inflows).unsqueeze(1)
-        #outflow_indices = torch.arange(num_outflows).unsqueeze(0)
-        #indicator = (inflow_indices == outflow_indices).float().reshape(-1)
-        
-        #print(similarities[0])
-        
-        #return similarities.numpy(), indicator.numpy()
-        #return np.stack(sims), np.array(labels)
         
         def compute_sim(in_emb, out_emb):
             """
@@ -371,10 +368,11 @@ if __name__ == "__main__":
 
             # Compute pairwise cosine similarity of windows
             all_sim = torch.bmm(in_emb.permute(1,0,2), out_emb.permute(1,2,0))
-            all_sim = all_sim.permute(1,2,0).reshape(-1, all_sim.shape[0])
+            all_sim = all_sim.permute(1,2,0)#.reshape(-1, all_sim.shape[0])
 
             return all_sim
 
+        # build sim vectors for all pairs
         sims = compute_sim(inflow_embeds, outflow_embeds)
         if args.temporal_alignment:
             sims2 = compute_sim(inflow_embeds.permute(0,2,1), 
@@ -383,60 +381,20 @@ if __name__ == "__main__":
         else:
             sims_both = sims
         
-        num_inflows = inflow_embeds.shape[0]
-        num_outflows = outflow_embeds.shape[0]
-        inflow_indices = torch.arange(num_inflows).unsqueeze(1)
-        outflow_indices = torch.arange(num_outflows).unsqueeze(0)
-        indicator = (inflow_indices == outflow_indices).float().reshape(-1)
-        
-        return sims_both.numpy(), indicator.numpy()
-
-    #va_sims, va_labels = build_sims(va_data)
-    #te_sims, te_labels = build_sims(te_data)
-    
-    va_sims, va_labels = build_sims(va_inflow_embeds, va_outflow_embeds)
-    te_sims, te_labels = build_sims(te_inflow_embeds, te_outflow_embeds)
+        return sims_both.numpy()
     
     
-    """
-    if args.drift_features:
-        
-        # dataloaders for drift 
-        #  (loading is deterministic so samples should be 
-        #       in the same order as the previous datasets)
-        drift_processor = DataProcessor(('time_dirs', 'sizes'))
-        va_data_drift = BaseDataset(pklpath, drift_processor,
-                                window_kwargs = None,
-                                preproc_feats = False,
-                                sample_idx = va_idx,
-                                **data_kwargs
-                            )
-        va_data_drift = PairwiseDataset(va_data_drift)
-        te_data_drift = BaseDataset(pklpath, drift_processor,
-                                window_kwargs = None,
-                                preproc_feats = False,
-                                sample_idx = te_idx,
-                                **data_kwargs
-                            )
-        te_data_drift = PairwiseDataset(te_data_drift)
-        
-        def build_feats(dataset):
-            feats = []
-            for sample1, sample2, _ in tqdm(dataset):
-                feats.append(create_drift_features(sample1[0][0], 
-                                                   sample2[0][0]))
-            return np.stack(feats)
-        
-        # generate features and concatenate them to the sims vector
-        va_feats = build_feats(va_data_drift)
-        va_sims = np.concatenate((va_sims, va_feats), axis=1)
-        te_feats = build_feats(te_data_drift)
-        te_sims = np.concatenate((te_sims, te_feats), axis=1)
-    """
+    va_sims = build_sims(va_inflow_embeds, va_outflow_embeds)
+    te_sims = build_sims(te_inflow_embeds, te_outflow_embeds)
+    
     
     # store data to file for later benchmarking
     with open(args.sims_file, 'wb') as fi:
-        pkl.dump({'va_sims': va_sims.astype(np.float16), 
+        data = {'va_sims': va_sims.astype(np.float16), 
                   'te_sims': te_sims.astype(np.float16),
-                  'va_labels': va_labels.astype(bool),
-                  'te_labels': te_labels.astype(bool)}, fi)
+                  'va_chain_labels': va_chain_labels.astype(np.float32),
+                  'te_chain_labels': te_chain_labels.astype(np.float32), 
+                  'va_host_labels': va_host_labels.astype(np.float32),
+                  'te_host_labels': te_host_labels.astype(np.float32)}
+        pkl.dump(data, fi)
+        print(len(np.unique(data['te_chain_labels'])))
