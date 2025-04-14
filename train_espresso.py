@@ -98,9 +98,10 @@ def parse_args():
     parser.add_argument('--w', default = 0.0, type = float,
                         help = "Weight placed on the chain-loss of multi-task loss."
                     )
-    parser.add_argument(
-        '--temporal_alignment', action='store_true', help='Use temporal alignment loss'
-    )
+    parser.add_argument('--temporal_alignment', 
+                        action = 'store_true', 
+                        help = 'Use temporal alignment loss'
+                    )
 
     # Model architecture options
     parser.add_argument('--config',
@@ -236,13 +237,6 @@ if __name__ == "__main__":
     # # # # # #
     pklpath = args.data
     
-    idx = np.arange(0,10000)
-    np.random.seed(42)
-    np.random.shuffle(idx)
-    te_idx = idx[0:500]
-    va_idx = idx[500:1000]
-    tr_idx = idx[1000:10000]
-    
     #def build_dataset(pklpath, processor, in_idx=1):
     #    chains = load_dataset(pklpath)#, sample_idx)
     #    inflow, outflow = [],[]
@@ -279,6 +273,9 @@ if __name__ == "__main__":
         in_idx = 1
     inflow, outflow, targets = build_dataset(pklpath, processor, inflow_size, outflow_size, in_idx=in_idx)
     #tr_inflow, tr_outflow, tr_targets = build_dataset(pklpath, processor, tr_idx)
+    
+    te_idx, va_idx, tr_idx = get_split_idx(len(inflow))
+    
     va_inflow = inflow[va_idx]
     va_outflow = outflow[va_idx]
     tr_inflow = inflow[tr_idx]
@@ -443,11 +440,6 @@ if __name__ == "__main__":
 
                 # online loss variant
                 if args.online:
-                    #inputs, labels, targets = data
-                    #inputs = inputs.to(device)
-                    #N, S, F = inputs.shape
-                    #labels = labels.to(device)
-                    #targets = targets.to(device)
                     inflow_inputs, outflow_inputs, targets = data
                     targets = targets.to(device)
                     N = targets.size(0)

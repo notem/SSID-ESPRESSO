@@ -90,6 +90,9 @@ def parse_args():
     parser.add_argument('--ckpt_epoch',
                         type=int,
                         default=10)
+    parser.add_argument('--eval',
+                        action='store_true',
+                        default=False)
     
     return parser.parse_args()
 
@@ -114,7 +117,7 @@ if __name__ == "__main__":
     model_name = "DF"
     checkpoint_dir = args.ckpt_dir
     results_dir = args.results_dir
-    eval_only = False
+    eval_only = args.eval
 
     # # # # # #
     # finetune config
@@ -245,22 +248,11 @@ if __name__ == "__main__":
                                                     last_epoch = ((last_epoch+1) * len(trainloader) // accum) - 1,
                                                 )
 
-    # define checkpoint fname if not provided
-    if not checkpoint_fname:
-        checkpoint_fname = f'{model_name}'
-        checkpoint_fname += f'_{time.strftime("%Y%m%d-%H%M%S")}'
-
     # create checkpoint directory if necesary
-    if not os.path.exists(f'{checkpoint_dir}/{checkpoint_fname}/'):
-        try:
-            os.makedirs(f'{checkpoint_dir}/{checkpoint_fname}/')
-        except:
-            pass
+    if not os.path.exists(f'{checkpoint_dir}/'):
+        os.makedirs(f'{checkpoint_dir}/', exist_ok=True)
     if not os.path.exists(results_dir):
-        try:
-            os.makedirs(results_dir)
-        except:
-            pass
+        os.makedirs(results_dir, exist_ok=True)
 
     # # # # # #
     # print parameter count of metaformer model (head not included)
@@ -340,9 +332,7 @@ if __name__ == "__main__":
         test_loss = 0.
         up_acc = 0
         down_acc = 0
-        test_acc2 = {}
-        test_acc3 = {}
-        test_acc4 = {}
+        all_res = {'targets': [], 'preds': []}
         n = 0
         with tqdm(testloader, desc=f"Epoch {i} Test", dynamic_ncols=True) as pbar:
             for batch_idx, (inputs, targets) in enumerate(pbar):
@@ -350,17 +340,14 @@ if __name__ == "__main__":
 
                 # # # # # #
                 # DF prediction
-                pred = net(inputs)
+                pred = F.relu(net(inputs))
                 #pred = torch.clamp(pred,min=1)
                 loss = criterion(pred, targets)
+                
+                all_res['targets'].append(targets.cpu().numpy())
+                all_res['preds'].append(pred.cpu().numpy())
 
                 test_loss += loss.item()
-
-                #pred = pred[:,1]
-                #targets = targets[:,1]
-                #length_pred = torch.round(pred)
-                #correct = length_pred == targets
-                #test_acc += torch.sum(correct).item()
 
                 up_pred = pred[:,1]
                 up_targets = targets[:,1]
@@ -374,30 +361,47 @@ if __name__ == "__main__":
 
                 n += len(targets)
 
-                #soft_res = F.softmax(cls_pred, dim=1)
-                #y_prob, y_pred = soft_res.max(1)
-                #test_acc += torch.sum(y_pred == targets).item()
-                #for i in range(len(targets)):
-                #    lab = int(targets[i].item())
-                #    err = abs((targets[i] - pred[i]).item())
-                #    cor = correct[i].item()
-                #    test_acc2[lab] = test_acc2.get(lab, 0) + cor
-                #    test_acc3[lab] = test_acc3.get(lab, 0) + 1
-                #    test_acc4[lab] = test_acc4.get(lab, []) + [err]
-
                 pbar.set_postfix({
                                   'down_acc': down_acc/n,
                                   'up_acc': up_acc/n,
                                   'loss': test_loss/(batch_idx+1),
                                 })
 
-        #keys = sorted(list(test_acc2.keys()))
-        #for key in keys:
-        #    print(f'\t{key} ({test_acc3[key] / n:0.2f}): {test_acc2[key] / test_acc3[key]:0.3f} - {np.mean(test_acc4[key]):0.3f}|{np.std(test_acc4[key]):0.3f}')
+        all_targets = np.concatenate(all_res['targets'])
+        all_preds = np.concatenate(all_res['preds'])
+        all_error = all_targets - all_preds
+        print(f'Error: {np.mean(all_error):0.3f}|{np.std(all_error):0.3f}')
+        # up accuracy
+        print(f'Up accuracy: {up_acc/n:.4f}')
+        # down accuracy
+        print(f'Down accuracy: {down_acc/n:.4f}')
+        
+        metrics = {'loss': test_loss, 'up_acc': up_acc/n, 'down_acc': down_acc/n}
+        # add error and per-chain accuracy to metrics
+        metrics.update({'error': np.mean(all_error), 'error_std': np.std(all_error)})
+        
+        # for both up and down, print the accuracy calculated for each unique chain length
+        for chain_length in np.unique(all_targets[:,1]):
+            idx = all_targets[:,1] == chain_length
+            up_acc = np.sum(np.round(all_preds[idx,1]) == all_targets[idx,1]) / np.sum(idx)
+            print(f'Up accuracy for chain length {chain_length}: {up_acc:.4f}')
+            # print error
+            error = all_targets[idx,1] - all_preds[idx,1]
+            print(f'Error for chain length {chain_length}: {np.mean(error):0.3f}|{np.std(error):0.3f}')
+            metrics.update({f'up_acc_{chain_length}': up_acc, f'up_error_{chain_length}': np.mean(error), f'up_error_std_{chain_length}': np.std(error)})
+        for chain_length in np.unique(all_targets[:,0]):
+            idx = all_targets[:,0] == chain_length
+            down_acc = np.sum(np.round(all_preds[idx,0]) == all_targets[idx,0]) / np.sum(idx)
+            print(f'Down accuracy for chain length {chain_length}: {down_acc:.4f}')
+            # print error
+            error = all_targets[idx,0] - all_preds[idx,0]
+            print(f'Error for chain length {chain_length}: {np.mean(error):0.3f}|{np.std(error):0.3f}')
+            metrics.update({f'down_acc_{chain_length}': down_acc, f'down_error_{chain_length}': np.mean(error), f'down_error_std_{chain_length}': np.std(error)})
 
-        test_loss /= batch_idx + 1
-        #test_acc /= n
-        return test_loss#, test_acc
+        #test_loss /= batch_idx + 1
+        ##test_acc /= n
+        #return test_loss#, test_acc
+        return metrics
 
 
     # run eval only
@@ -408,8 +412,8 @@ if __name__ == "__main__":
             epoch = -1
             train_loss = train_iter(epoch, eval_only=True)
             print(f'[{epoch}] tr. loss ({train_loss:0.3f})')
-            test_loss = test_iter(epoch)
-            print(f'[{epoch}] te. loss ({test_loss:0.3f})')
+            te_metrics = test_iter(epoch)
+            #print(f'[{epoch}] te. loss ({test_loss:0.3f})')
         else:
             print(f'Could not load checkpoint [{checkpoint_path}]: Path does not exist')
 
@@ -426,12 +430,13 @@ if __name__ == "__main__":
                 if testloader is not None:
                     net.eval()
                     with torch.no_grad():
-                        test_loss = test_iter(epoch)
-                    metrics.update({'te_loss': test_loss})
+                        te_metrics = test_iter(epoch)
+                    metrics.update(te_metrics)
+                    #metrics.update({'te_loss': test_loss})
 
                     if (epoch % ckpt_period) == (ckpt_period-1):
                         # save last checkpoint before restart
-                        checkpoint_path_epoch = f"{checkpoint_dir}/{checkpoint_fname}/e{epoch}.pth"
+                        checkpoint_path_epoch = f"{checkpoint_dir}/e{epoch}.pth"
                         print(f"Saving end-of-cycle checkpoint to {checkpoint_path_epoch}...")
                         torch.save({
                                         "epoch": epoch,
@@ -448,7 +453,7 @@ if __name__ == "__main__":
         finally:
             if not os.path.exists(results_dir):
                 os.makedirs(results_dir)
-            results_fp = f'{results_dir}/{checkpoint_fname}.txt'
+            results_fp = f'{results_dir}/loss_log.txt'
             with open(results_fp, 'w') as fi:
                 json.dump(history, fi, indent='\t')
 

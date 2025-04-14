@@ -1,502 +1,363 @@
-import torch
+import os
+import numpy as np
+import torch 
 import torch.nn as nn
 import torch.optim as optim
-import torch.nn.functional as F
-import numpy as np
-import os
-from os.path import join
-from tqdm import tqdm
-import transformers
-import json
-import time
+from torch.utils.data import Dataset, DataLoader, Sampler
+import random
 import argparse
-from torch.utils.data import DataLoader
+import torch.nn.functional as F
+import math
 
-from utils.nets.transdfnet import DFNet
-from utils.layers import Mlp
+import torch
+from torch import nn
+from torch.nn import functional as F
 from utils.processor import DataProcessor
 from utils.data import *
-from utils.loss import *
 
+class DFModel(nn.Module):
+    def __init__(self, input_shape=(5, 1000), emb_size=64):
+        super(DFModel, self).__init__()
+        
+        self.block1_conv1 = nn.Conv1d(input_shape[0], 32, 8, padding='same')
+        self.block1_adv_act1 = nn.ELU()
+        self.block1_conv2 = nn.Conv1d(32, 32, 8, padding='same')
+        self.block1_adv_act2 = nn.ELU()
+        self.block1_pool = nn.MaxPool1d(8, stride=3, padding=2)
+        self.block1_dropout = nn.Dropout(0.1)
 
+        self.block2_conv1 = nn.Conv1d(32, 64, 8, padding='same')
+        self.block2_act1 = nn.ReLU()
+        self.block2_conv2 = nn.Conv1d(64, 64, 8, padding='same')
+        self.block2_act2 = nn.ReLU()
+        self.block2_pool = nn.MaxPool1d(8, stride=3, padding=2)
+        self.block2_dropout = nn.Dropout(0.1)
 
-# enable if NaN or other odd behavior appears
-#torch.autograd.set_detect_anomaly(True)
-# disable any unnecessary logging / debugging
-torch.autograd.set_detect_anomaly(False)
-torch.autograd.profiler.profile(False)
-torch.autograd.profiler.emit_nvtx(False)
+        self.block3_conv1 = nn.Conv1d(64, 128, 8, padding='same')
+        self.block3_act1 = nn.ReLU()
+        self.block3_conv2 = nn.Conv1d(128, 128, 8, padding='same')
+        self.block3_act2 = nn.ReLU()
+        self.block3_pool = nn.MaxPool1d(8, stride=3, padding=2)
+        self.block3_dropout = nn.Dropout(0.1)
 
-# auto-optimize cudnn ops
-torch.backends.cudnn.benchmark = True
+        self.block4_conv1 = nn.Conv1d(128, 256, 8, padding='same')
+        self.block4_act1 = nn.ReLU()
+        self.block4_conv2 = nn.Conv1d(256, 256, 8, padding='same')
+        self.block4_act2 = nn.ReLU()
+        self.block4_pool = nn.MaxPool1d(8, stride=3, padding=2)
 
+        self.flatten = nn.Flatten()
+        self.input_shape = input_shape
+        
+        flat_size = self._get_flattened_size()
+        self.dense = nn.Linear(flat_size, emb_size)
 
+    def _get_flattened_size(self):
+        x = torch.zeros(1, *self.input_shape)
+        x = self.block1_pool(self.block1_conv2(self.block1_conv1(x)))
+        x = self.block2_pool(self.block2_conv2(self.block2_conv1(x)))
+        x = self.block3_pool(self.block3_conv2(self.block3_conv1(x)))
+        x = self.block4_pool(self.block4_conv2(self.block4_conv1(x)))
+        x = self.flatten(x)
+        return x.size(1)
+
+    def forward(self, x):
+        x = self.block1_pool(self.block1_adv_act2(self.block1_conv2(self.block1_adv_act1(self.block1_conv1(x)))))
+        x = self.block1_dropout(x)
+        x = self.block2_pool(self.block2_act2(self.block2_conv2(self.block2_act1(self.block2_conv1(x)))))
+        x = self.block2_dropout(x)
+        x = self.block3_pool(self.block3_act2(self.block3_conv2(self.block3_act1(self.block3_conv1(x)))))
+        x = self.block3_dropout(x)
+        x = self.block4_pool(self.block4_act2(self.block4_conv2(self.block4_act1(self.block4_conv1(x)))))
+
+        x = self.flatten(x)
+        x = self.dense(x)
+        return x
+ 
 def parse_args():
-    parser = argparse.ArgumentParser(
-                        #prog = 'WF Benchmark',
-                        #description = 'Train & evaluate WF attack model.',
-                        #epilog = 'Text at the bottom of help'
-                        )
-
-    # experiment configuration options
-    #parser.add_argument('--data_dir', 
-    #                    default = './data', 
-    #                    type = str,
-    #                    help = "Set root data directory.")
+    parser = argparse.ArgumentParser(description="Train a deep learning model for inflow and outflow data.")
+    #parser.add_argument('--train_dir', type=str, default='data/', help="Directory containing the training .npy files.")
+    #parser.add_argument('--val_dir', type=str, default='data/', help="Directory containing the validation .npy files.")
+    parser.add_argument('--data', type=str, help="Directory containing the data files.")
+    parser.add_argument('--bs', type=int, default=128, help="Batch size for training.")
+    parser.add_argument('--margin', type=float, default=0.1, help="Margin for the triplet loss function.")
+    parser.add_argument('--learning_rate', type=float, default=0.0001, help="Initial learning rate.")
+    parser.add_argument('--num_epochs', type=int, default=500, help="Number of epochs to train.")
+    parser.add_argument('--model_name', type=str, default='final.pth', help="Name of the saved model file.")
     parser.add_argument('--ckpt_dir',
                         default = './checkpoint',
                         type = str,
                         help = "Set directory for model checkpoints.")
+    parser.add_argument('--temporal_alignment', 
+                        action = 'store_true', default=False,
+                        help = 'Use temporal alignment loss'
+                    )
+    parser.add_argument('--batched_windows', 
+                        action='store_true', default=False,
+                        help = "Include all windows of samples within batches.")
     parser.add_argument('--results_dir', 
-                        default = './results',
-                        type = str,
-                        help = "Set directory for result logs.")
-    parser.add_argument('--ckpt', 
-                        default = None, 
-                        type = str,
-                        help = "Resume from checkpoint path.")
-    parser.add_argument('--exp_name',
-                        type = str,
-                        default = f'{time.strftime("%Y%m%d-%H%M%S")}',
-                        help = "")
-    parser.add_argument('--online', 
-                        default=False, action='store_true',
-                        help = "Use online semi-hard triplet mining.")
-    parser.add_argument('--loss_margin', default=0.1, type=float,
-                        help = "Loss margin for triplet learning.")
-    parser.add_argument('--w', default=0.0,
-                        help = "Weight placed on the chain-loss of multi-task loss.")
-
-    # Model architecture options
-    parser.add_argument('--config',
-                        default = None,
-                        type = str,
-                        help = "Set model config (as JSON file)")
-    parser.add_argument('--input_size', 
-                        default = None, 
-                        type = int,
-                        help = "Overwrite the config .json input length parameter.")
-    parser.add_argument('--features', 
-                        default=None, type=str, nargs="+",
-                        help='Overwrite the features used in the config file. Multiple features can be provided.')
-
+                        default = './results',type = str,
+                        help = "Set directory for result logs."
+                    )
+    parser.add_argument('--single_fen', 
+                        default = False, action = 'store_true',
+                        help = 'Use the same FEN for in and out flows.')
     return parser.parse_args()
-
-
-if __name__ == "__main__":
-    """
-    """
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    args = parse_args()
-
-    # load checkpoint (if it exists)
-    checkpoint_path = args.ckpt
-    checkpoint_fname = None
-    resumed = None
-    if checkpoint_path and os.path.exists(checkpoint_path):
-        print("Resuming from checkpoint...")
-        resumed = torch.load(checkpoint_path)
-        checkpoint_fname = os.path.basename(os.path.dirname(checkpoint_path))
-    # else: checkpoint path and fname will be defined later if missing
-
-    model_name = "DF"
-    checkpoint_dir = args.ckpt_dir
-    results_dir = args.results_dir
-
-    # # # # # #
-    # finetune config
-    # # # # # #
-    mini_batch_size = 128   # samples to fit on GPU
-    batch_size = 128        # when to update model
-    accum = batch_size // mini_batch_size
-    # # # # # #
-    warmup_period   = 10
-    ckpt_period     = 30
-    epochs          = 300
-    opt_lr          = 1e-3
-    opt_betas       = (0.9, 0.999)
-    opt_wd          = 0.001
-    save_best_epoch = True
-    loss_margin = args.loss_margin
-    loss_delta = float(args.w)
-
-    # all trainable network parameters
-    params = []
-
-    # DF model config
-    if resumed:
-        model_config = resumed['config']
-    elif args.config:
-        with open(args.config, 'r') as fi:
-            model_config = json.load(fi)
+ 
+# Define the learning rate schedule function
+def lr_schedule(epoch, num_epochs, initial_lr):
+    if epoch < 100:
+        # Warmup phase
+        return initial_lr * (epoch / 100)
     else:
-        model_config = {
-                'input_size': 1200,
-                'feature_dim': 64,
-                'stage_count': 3,
-                "features": [
-                    "iats", 
-                    "sizes", 
-                    "burst_edges",
-                    ],
-                #"window_kwargs": {
-                #     'window_count': 1, 
-                #     'window_width': 0, 
-                #     'window_overlap': 0,
-                #     "include_all_window": True,
-                #     },
-                #"features": [
-                #    "interval_dirs_up", 
-                #    "interval_dirs_down", 
-                #    "interval_dirs_sum",
-                #    "interval_dirs_sub",
-                #    ],
-                "window_kwargs": {
-                     'window_count': 12, 
-                     'window_width': 6, 
-                     'window_overlap': 2,
-                     "include_all_window": True,
-                     },
-                #"window_kwargs": {
-                #     'window_count': 1, 
-                #     'window_width': 0, 
-                #     'window_overlap': 0,
-                #     "include_all_window": True,
-                #     },
-            }
-
-    if args.input_size is not None:
-        model_config['input_size'] = args.input_size
-    if args.features is not None:
-        model_config['features'] = args.features
-    features = model_config['features']
-
-    feature_dim = model_config['feature_dim']
-
-    print("==> Model configuration:")
-    print(json.dumps(model_config, indent=4))
-
-
-    # traffic feature extractor
-    fen = DFNet(feature_dim, len(features),
-                **model_config)
-    fen = fen.to(device)
-    if resumed:
-        fen_state_dict = resumed['fen']
-        fen.load_state_dict(fen_state_dict)
-    params += fen.parameters()
-
-    # chain length prediction head
-    head = Mlp(dim=feature_dim, out_features=2)
-    head = head.to(device)
-    if resumed:
-        head_state_dict = resumed['chain_head']
-        head.load_state_dict(head_state_dict)
-    params += head.parameters()
-
-    # # # # # #
-    # print parameter count of metaformer model (head not included)
-    param_count = sum(p.numel() for p in params if p.requires_grad)
-    param_count /= 1000000
-    param_count = round(param_count, 2)
-    print(f'=> Model is {param_count}m parameters large.')
-    # # # # # #
-
-
-    # # # # # #
-    # create data loaders
-    # # # # # #
-    # multi-channel feature processor
+        # Cosine annealing
+        return initial_lr * 0.5 * (1 + math.cos(math.pi * (epoch - 100) / (num_epochs - 100)))
+ 
+class CosineTripletLoss(nn.Module):
+    def __init__(self, margin=0.1):
+        super(CosineTripletLoss, self).__init__()
+        self.margin = margin
+        self.cosine_sim = nn.CosineSimilarity(dim=-1, eps=1e-6)
+ 
+    def forward(self, anchor, positive, negative):
+        pos_sim = self.cosine_sim(anchor, positive)
+        neg_sim = self.cosine_sim(anchor, negative)
+        loss = F.relu(neg_sim - pos_sim + self.margin)
+        return torch.mean(loss,dim=-1)
+ 
+class QuadrupleSampler(Sampler):
+    def __init__(self, data_source):
+        self.data_source = data_source
+    
+    def __iter__(self):
+        indices = list(range(len(self.data_source))) * 4
+        np.random.shuffle(indices)
+        return iter(indices)
+    
+    def __len__(self):
+        return 4 * len(self.data_source)
+ 
+def main():
+    args = parse_args()
+ 
+    features = ['dcf']
+    features = ('inv_iat_logs', 'iats', 
+                'sizes', 'burst_edges', 'running_rates', 
+                'cumul_norm', 'times_norm')
+    input_size = 1000
+    features = (
+        "interval_dirs_up",
+        "interval_dirs_down",
+        "interval_dirs_sum",
+        "interval_dirs_sub",
+        "interval_size_up",
+        "interval_size_down",
+        "interval_size_sum",
+        "interval_size_sub",
+        "interval_iats",
+        "interval_inv_iat_logs",
+        "interval_cumul_norm",
+        "interval_times_norm"
+        )
+    input_size = 200
     processor = DataProcessor(features)
 
-    pklpath = '../data/ssh/processed_nov17_fixtime.pkl'
-    #pklpath = '../data/ssh_socat/processed_nov30.pkl'
-
-    # chain-based sample splitting
-    te_idx = np.arange(0,1000)
-    va_idx = np.arange(1000,2000)
-    tr_idx = np.arange(2000,10000)
-
-    # stream window definitions
-    window_kwargs = model_config['window_kwargs']
-    data_kwargs = {
-            'host_only': True,
-            #'stream_ID_range': (1,float('inf')),
-            #'stream_ID_range': (0,1),
-            }
-
-    def make_dataloader(idx, **kwargs):
-        """
-        """
-        dataset = BaseDataset(pklpath, processor,
-                            window_kwargs = window_kwargs,
-                            #preproc_feats = False,
-                            preproc_feats = False,
-                            sample_idx = idx,
-                            **kwargs,
-                            )
-        if args.online:
-            dataset = OnlineDataset(dataset, k=2)
-
-        else:
-            dataset = OfflineDataset(dataset)
-        loader = DataLoader(dataset,
-                            batch_size=mini_batch_size, 
-                            collate_fn=dataset.batchify,
-                            shuffle=True)
-        return loader, dataset
-
-
-    # prepare train data
-    trainloader, tr_data = make_dataloader(tr_idx, **data_kwargs)
-
-    # prepare validation data (if enabled)
-    if save_best_epoch:
-        validationloader, va_data = make_dataloader(va_idx, **data_kwargs)
-    else:
-        validationloader = None
-
-    # prepare test data
-    testloader, te_data = make_dataloader(te_idx, **data_kwargs)
+    window_kwargs = {
+        "window_count": 11,
+        "window_width": 5,
+        "window_overlap": 3,
+        "include_all_window": True
+    }
+    inflow, outflow, _ = build_dataset(args.data, processor, 
+                                             input_size, input_size, in_idx=1, 
+                                             window_kwargs = window_kwargs,
+                                             )
+    #out_idx = -1
+    #outflow = np.array([x[out_idx] for x in outflow])
     
-
-    # # # # # #
-    # optimizer and params, reload from resume is possible
-    # # # # # #
-    optimizer = optim.AdamW(params,
-            lr=opt_lr, betas=opt_betas, weight_decay=opt_wd)
-    if resumed and resumed.get('opt', None):
-        opt_state_dict = resumed['opt']
-        optimizer.load_state_dict(opt_state_dict)
-
-    last_epoch = -1
-    if resumed and resumed['epoch']:    # if resuming from a finetuning checkpoint
-        last_epoch = resumed['epoch']
-
-    scheduler = transformers.get_cosine_with_hard_restarts_schedule_with_warmup(optimizer, 
-                                                                num_warmup_steps = warmup_period * len(trainloader), 
-                                                                num_training_steps = epochs * len(trainloader), 
-                                                                num_cycles = epochs // ckpt_period,
-                                                                #last_epoch = last_epoch * len(trainloader) if last_epoch
-                                                                )
-
-    # define checkpoint fname if not provided
-    if not checkpoint_fname:
-        checkpoint_fname = f'{model_name}'
-        checkpoint_fname += f'_{args.exp_name}'
-
-    # create checkpoint directory if necesary
-    if not os.path.exists(f'{checkpoint_dir}/{checkpoint_fname}/'):
-        try:
-            os.makedirs(f'{checkpoint_dir}/{checkpoint_fname}/')
-        except:
-            pass
-    if not os.path.exists(results_dir):
-        try:
-            os.makedirs(results_dir)
-        except:
-            pass
-
-
-    #criterion = nn.MSELoss()
-    criterion = nn.SmoothL1Loss(beta=1.0)
-    if args.online:
-        triplet_criterion = OnlineCosineTripletLoss(margin=loss_margin)
+    te_idx, va_idx, tr_idx = get_split_idx(len(inflow))
+    
+    val_inflows = inflow[va_idx]
+    val_outflows = outflow[va_idx]
+    train_inflows = inflow[tr_idx]
+    train_outflows = outflow[tr_idx]
+    print(val_inflows.shape, val_outflows.shape)
+ 
+    # Define the datasets
+    train_dataset = TripletDataset(train_inflows, train_outflows, 
+                                   as_window = not args.batched_windows)
+    val_dataset = TripletDataset(val_inflows, val_outflows, 
+                                 as_window = not args.batched_windows)
+ 
+    train_sampler = QuadrupleSampler(train_dataset)
+    val_sampler = QuadrupleSampler(val_dataset)
+ 
+    # Create the dataloaders
+    train_loader = DataLoader(train_dataset, batch_size=args.bs, 
+                              #sampler=train_sampler
+                              )
+    val_loader = DataLoader(val_dataset, batch_size=args.bs, 
+                            #sampler=val_sampler
+                            )
+ 
+    # Instantiate the models
+    inflow_model = DFModel(input_shape=(len(features),input_size), emb_size=64)
+    params = list(inflow_model.parameters())
+    if not args.single_fen:
+        outflow_model = DFModel(input_shape=(len(features),input_size), emb_size=64)
+        params +=  list(outflow_model.parameters())
     else:
-        triplet_criterion = CosineTripletLoss(margin=loss_margin)
-
-
-    def epoch_iter(dataloader, 
-                    eval_only = False, 
-                    desc = f"Epoch"):
-        """
-        Step through one epoch on the dataset
-        """
-        tot_loss = 0.
-        trip_loss = 0.
-
-        acc = 0
-        up_acc = 0
-        down_acc = 0
-
-        n = 0
-        with tqdm(dataloader,
-                desc = desc,
-                dynamic_ncols = True) as pbar:
-            for batch_idx, data in enumerate(pbar):
-
-                # online loss variant
-                if args.online:
-                    inputs, labels, targets = data
-                    inputs = inputs.to(device)
-                    labels = labels.to(device)
-                    targets = targets.to(device)
-
-                    embed = fen(inputs)
-                    
-                    #correlated_pairs = labels == labels
-                    
-                    triplet_loss_f = triplet_criterion(embed, labels)
-                   # triplet_loss_f = triplet_criterion(inflow_embed, outflow_embed)
-                    triplet_loss =  torch.sum(triplet_loss_f) / (torch.count_nonzero(triplet_loss_f) + 1e-6)
-                    trip_loss += triplet_loss.item()
-
-                    pred = head(embed)
-                    chain_loss = criterion(pred, targets)
-
-
-                # offline / random triplets
-                else:
-                    inputs_anc, inputs_pos, inputs_neg, targets = data
-                    inputs_anc = inputs_anc.to(device)
-                    inputs_pos = inputs_pos.to(device)
-                    inputs_neg = inputs_neg.to(device)
-                    targets = targets.to(device)
-
-                    # # # # # #
-                    # generate traffic feature vectors & run triplet loss
-                    anc_embed = fen(inputs_anc)
-                    pos_embed = fen(inputs_pos)
-                    neg_embed = fen(inputs_neg)
-                    triplet_loss_f = triplet_criterion(anc_embed, pos_embed, neg_embed)
-                    triplet_loss =  torch.sum(triplet_loss_f) / (torch.count_nonzero(triplet_loss_f) + 1e-6)
-                    trip_loss += triplet_loss.item()
-
-                    # # # # #
-                    # predict chain length with head & run loss
-                    #pred = head(torch.cat((anc_embed, pos_embed), dim=-1))
-                    pred = head(anc_embed)
-                    #pred = head(torch.cat((anc_embed, anc_embed2), dim=-1))
-                    #pred = torch.clamp(pred,min=1)
-                    chain_loss = criterion(pred, targets)
-
-                # combined multi-task loss
-                loss = triplet_loss + (loss_delta * chain_loss)
-                tot_loss += loss.item()
-
-                #
-                # accuracy predicted as all-or-nothing
-                #
-                length_pred = torch.round(pred[:,0])
-                up_acc += torch.sum(length_pred == targets[:,0]).item()
-
-                length_pred = torch.round(pred[:,1])
-                down_acc += torch.sum(length_pred == targets[:,1]).item()
-
-                acc = (up_acc + down_acc)/2
-                #
-                # # # # #
-
-                n += len(targets)
-
-                if not eval_only:
-                    loss /= accum   # normalize to full batch size before computing gradients
-                    loss.backward()
-                    # update weights, update scheduler, and reset optimizer after a full batch is completed
-                    if (batch_idx+1) % accum == 0 or batch_idx+1 == len(dataloader):
-                        optimizer.step()
-                        scheduler.step()
-                        for param in params:
-                            param.grad = None
-
-
-                pbar.set_postfix({
-                                  'up_acc': up_acc/n,
-                                  'down_acc': down_acc/n,
-                                  'triplet': trip_loss/(batch_idx+1),
-                                  'tot_loss': tot_loss/(batch_idx+1),
-                                  })
-                pbar.set_description(desc)
-
-        tot_loss /= batch_idx + 1
-        acc /= n
-        return tot_loss
-
-
-    # do training
-    history = {}
+        outflow_model = inflow_model
+ 
+    # Move models to GPU if available
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    inflow_model.to(device)
+    outflow_model.to(device)
+ 
+    # Define the loss function and the optimizer
+    criterion = CosineTripletLoss(margin=args.margin)
+    optimizer = optim.Adam(params, lr=args.learning_rate)
+ 
+    # Training loop
+    
     try:
-        for epoch in range(last_epoch+1, epochs):
+        best_val_loss = float("inf")
+        history = {}
+        for epoch in range(args.num_epochs):
+            metrics = {}
+            lr = lr_schedule(epoch, args.num_epochs, args.learning_rate)
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = lr
 
-            # train and update model using training data
-            fen.train()
-            head.train()
-            train_loss = epoch_iter(trainloader, 
-                                    desc = f"Epoch {epoch} Train")
-            metrics = {'tr_loss': train_loss}
-            if not args.online:
-                tr_data.reset_split()
+            train_dataset.reset_split()
+            val_dataset.reset_split()
+ 
+            # Training
+            inflow_model.train()
+            outflow_model.train()
+ 
+            running_loss = 0.0
+            for anchor, positive, negative in train_loader:
+                anchor = anchor.float().to(device)
+                positive = positive.float().to(device)
+                negative = negative.float().to(device)
+                N = anchor.size(0)
 
-            # evaluate on hold-out data
-            fen.eval()
-            head.eval()
-            if validationloader is not None:
-                with torch.no_grad():
-                    va_loss = epoch_iter(validationloader, 
-                                            eval_only = True, 
-                                            desc = f"Epoch {epoch} Val.")
-                metrics.update({'va_loss': va_loss})
+                if args.batched_windows:
+                    anchor = anchor.view(anchor.size(0)*anchor.size(1), 
+                                            anchor.size(2), anchor.size(3))
+                    positive = positive.view(positive.size(0)*positive.size(1), 
+                                            positive.size(2), positive.size(3))
+                    negative = negative.view(negative.size(0)*negative.size(1), 
+                                            negative.size(2), negative.size(3))
+ 
+                anchor_embeddings = inflow_model(anchor)
+                positive_embeddings = outflow_model(positive)
+                negative_embeddings = outflow_model(negative)
+
+                if args.batched_windows:
+                    anchor_embeddings = anchor_embeddings.view(N, -1, anchor_embeddings.size(-1))
+                    positive_embeddings = positive_embeddings.view(N, -1, positive_embeddings.size(-1))
+                    negative_embeddings = negative_embeddings.view(N, -1, negative_embeddings.size(-1))
+ 
+                loss = criterion(anchor_embeddings, positive_embeddings, negative_embeddings)
+                
+                if args.temporal_alignment and args.batched_windows:
+                    t_loss = criterion(anchor_embeddings.permute(0,2,1),
+                                        positive_embeddings.permute(0,2,1),
+                                        negative_embeddings.permute(0,2,1))
+                    a_loss = ((loss - t_loss)**2)
+                    loss = (loss + t_loss) / 2 + a_loss
+                loss = loss.mean()
+ 
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+ 
+                running_loss += loss.item()
+ 
+            train_loss = running_loss / len(train_loader)
+            metrics['train_loss'] = train_loss
+ 
+            # Validation
+            inflow_model.eval()
+            outflow_model.eval()
+ 
+            running_loss = 0.0
             with torch.no_grad():
-                test_loss = epoch_iter(testloader, 
-                                        eval_only = True, 
-                                        desc = f"Epoch {epoch} Test")
-            metrics.update({'te_loss': test_loss})
+                for anchor, positive, negative in val_loader:
+                    anchor = anchor.float().to(device)
+                    positive = positive.float().to(device)
+                    negative = negative.float().to(device)
+                    N = anchor.size(0)
 
-            # save model
-            if (epoch % ckpt_period) == (ckpt_period-1):
-                # save last checkpoint before restart
-                checkpoint_path_epoch = f"{checkpoint_dir}/{checkpoint_fname}/e{epoch}.pth"
-                print(f"Saving end-of-cycle checkpoint to {checkpoint_path_epoch}...")
-                #torch.save({
-                #                "epoch": epoch,
-                #                "fen": fen.state_dict(),
-                #                "chain_head": head.state_dict(),
-                #                "opt": optimizer.state_dict(),
-                #                "config": model_config,
-                #        }, checkpoint_path_epoch)
-                torch.save({
-                                "epoch": epoch,
-                                "inflow_fen": fen.state_dict(),
-                                "outflow_fen": None,
-                                "chain_head": head.state_dict(),
-                                "opt": optimizer.state_dict(),
-                                "config": model_config,
-                                #"train_config": train_params,
-                        }, checkpoint_path_epoch)
+                    if args.batched_windows:
+                        anchor = anchor.view(anchor.size(0)*anchor.size(1), 
+                                                anchor.size(2), anchor.size(3))
+                        positive = positive.view(positive.size(0)*positive.size(1), 
+                                                positive.size(2), positive.size(3))
+                        negative = negative.view(negative.size(0)*negative.size(1), 
+                                                negative.size(2), negative.size(3))
+ 
+                    anchor_embeddings = inflow_model(anchor)
+                    positive_embeddings = outflow_model(positive)
+                    negative_embeddings = outflow_model(negative)
 
-            if save_best_epoch:
-                best_val_loss = min([999]+[metrics['va_loss'] for metrics in history.values()])
-                if metrics['va_loss'] < best_val_loss:
-                    checkpoint_path_epoch = f"{checkpoint_dir}/{checkpoint_fname}/best.pth"
-                    print(f"Saving new best model to {checkpoint_path_epoch}...")
-                    #torch.save({
-                    #                "epoch": epoch,
-                    #                "fen": fen.state_dict(),
-                    #                "chain_head": head.state_dict(),
-                    #                "opt": optimizer.state_dict(),
-                    #                "config": model_config,
-                    #        }, checkpoint_path_epoch)
-                    torch.save({
-                                    "epoch": epoch,
-                                    "inflow_fen": fen.state_dict(),
-                                    "outflow_fen": None,
-                                    "chain_head": head.state_dict(),
-                                    "opt": optimizer.state_dict(),
-                                    "config": model_config,
-                                    #"train_config": train_params,
-                            }, checkpoint_path_epoch)
-
-
-            history[epoch] = metrics
-
+                    if args.batched_windows:
+                        anchor_embeddings = anchor_embeddings.view(N, -1, anchor_embeddings.size(-1))
+                        positive_embeddings = positive_embeddings.view(N, -1, positive_embeddings.size(-1))
+                        negative_embeddings = negative_embeddings.view(N, -1, negative_embeddings.size(-1))
+ 
+                    loss = criterion(anchor_embeddings, positive_embeddings, negative_embeddings)
+                    
+                    if args.temporal_alignment and args.batched_windows:
+                        t_loss = criterion(anchor_embeddings.permute(0,2,1),
+                                            positive_embeddings.permute(0,2,1),
+                                            negative_embeddings.permute(0,2,1))
+                        a_loss = ((loss - t_loss)**2)
+                        loss = (loss + t_loss) / 2 + a_loss
+                    loss = loss.mean()
+ 
+                    running_loss += loss.item()
+ 
+            val_loss = running_loss / len(val_loader)
+            metrics['val_loss'] = val_loss
+ 
+            print(f'Epoch {epoch+1}/{args.num_epochs}, Train Loss: {train_loss}, Val Loss: {val_loss}')
+ 
+            # Save the model if it's the best one so far
+            #if val_loss < best_val_loss:
+            #    print("Best model so far!")
+            #    best_val_loss = val_loss
+            os.makedirs(args.ckpt_dir, exist_ok=True)
+            save_path = os.path.join(args.ckpt_dir, args.model_name)
+            torch.save({
+                'epoch': epoch,
+                'config': {
+                            'name': 'DCF', 
+                            'features': features,
+                            'window_kwargs': window_kwargs,
+                            'feature_dim': 64,
+                        },
+                'inflow_fen': inflow_model.state_dict(),
+                'outflow_fen': outflow_model.state_dict(),
+                'opt': optimizer.state_dict(),
+                'best_val_loss': best_val_loss,
+            }, save_path)
+            
+            history['epochs'] = metrics
+            
     except KeyboardInterrupt:
         pass
 
     finally:
-        if not os.path.exists(results_dir):
-            os.makedirs(results_dir)
-        results_fp = f'{results_dir}/{checkpoint_fname}.txt'
+        if not os.path.exists(args.results_dir):
+            os.makedirs(args.results_dir)
+            
+        results_fp = f'{args.results_dir}/log.txt'
         with open(results_fp, 'w') as fi:
             json.dump(history, fi, indent='\t')
-
+ 
+if __name__ == "__main__":
+    main()
+ 

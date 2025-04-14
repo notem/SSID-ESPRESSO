@@ -24,7 +24,7 @@ torch.backends.cudnn.benchmark = True
 
 
 class MyDataset(Dataset):
-    def __init__(self, sims, labels, ratio=25):
+    def __init__(self, sims, labels, ratio=None):
         self.inputs = sims
         self.targets = np.array(labels)
         self.indices = np.arange(len(self.targets))
@@ -33,9 +33,13 @@ class MyDataset(Dataset):
         self.tot_neg = len(self.targets) - self.tot_pos
         
         #corr_weight = self.tot_neg / self.tot_pos
-        corr_weight = self.tot_neg / self.tot_pos
-        corr_weight /= ratio
-        self.weights = torch.DoubleTensor([corr_weight if label else 1 for label in self.targets])
+        if ratio is not None:
+            corr_weight = self.tot_neg / self.tot_pos
+            corr_weight /= ratio
+            weights = torch.DoubleTensor([corr_weight if label else 1 for label in self.targets])
+            self.sampler = WeightedRandomSampler(weights, len(weights))
+        else:
+            self.sampler = None
 
     def __len__(self):
         return len(self.targets)
@@ -103,6 +107,10 @@ def parse_args():
                         help="Dropout percentage during training. \
                             This dropout rate is applied to all layer (including the input layer).",
                   )
+    parser.add_argument('--ratio',
+                        default = None,
+                        type=float,
+                        help="Ratio of negative to positive samples in the training dataset (1==balanced).",)
     parser.add_argument('--ckpt',
                         default = None,
                         type=str,
@@ -115,6 +123,7 @@ def parse_args():
 if __name__ == "__main__":
 
     args = parse_args()
+    train_ratio = args.ratio
 
     dirpath = os.path.dirname(args.results_file)
     if not os.path.exists(dirpath):
@@ -129,32 +138,21 @@ if __name__ == "__main__":
     te_sims = data['te_sims']
     te_labels = data['te_labels']
     
-    # Load the data
-    #val_data = np.load('/home/njm3308/SSID/espresso/data/val_output.npy')
-    #test_data = np.load('/home/njm3308/SSID/espresso/data/test_output.npy')
-
-    #cutoff = 108
-
-    ## Split the data into inputs and targets
-    #va_sims = val_data[:, :-2]
-    #va_labels = val_data[:, -1]
-    #te_sims = test_data[:, :-2]
-    #te_labels = test_data[:, -1]
-    
-    tr_dataset = MyDataset(va_sims, va_labels)
+    tr_dataset = MyDataset(va_sims, va_labels, ratio = train_ratio)
     te_dataset = MyDataset(te_sims, te_labels)
     del data
+    print(tr_dataset.inputs.shape, tr_dataset.targets.shape)
+    print(te_dataset.inputs.shape, te_dataset.targets.shape)
     
     # Create PyTorch dataloaders
     tr_batch_size = 256
     te_batch_size = 2048*16
-    num_epochs = 50
+    num_epochs = 30
     
     # use weighted sampler to balance training dataset
-    tr_sampler = WeightedRandomSampler(tr_dataset.weights, len(tr_dataset.weights))
     tr_loader = DataLoader(tr_dataset, 
             batch_size = tr_batch_size, 
-            sampler = tr_sampler,
+            sampler = tr_dataset.sampler,
             pin_memory = True,
             )
     # (no sampler) evaluate on all pairwise cases in test set
@@ -175,7 +173,8 @@ if __name__ == "__main__":
                                                 len(tr_loader), 
                                                 len(tr_loader)*num_epochs)
     
-    if args.ckpt is None or not os.path.exists(args.ckpt):
+    #if args.ckpt is None or not os.path.exists(args.ckpt):
+    if True:
         # Training loop
         for epoch in range(num_epochs):
             # Training
@@ -186,13 +185,15 @@ if __name__ == "__main__":
             with tqdm(total=len(tr_loader)) as pbar:
                 for i, (inputs, targets) in enumerate(tr_loader):
                     # Move tensors to the correct device
+                    margin = 0.15  # soft-loss to avoid overfitting (improves model's ability to reach very low FPR values)
+                    targets = torch.clip(targets, min=margin, max=1-margin)
+                    #targets += (torch.rand_like(targets) - 0.5) * margin * 2
                     inputs, targets = inputs.to(device), targets.to(device)
-    
+                    
                     # Forward pass
-                    outputs = model(inputs)
+                    outputs = torch.sigmoid(model(inputs))
                     loss = criterion(outputs, targets)
-                    logits = torch.sigmoid(outputs) >= 0.5
-                    correct_pred += (logits == targets).sum().item()
+                    correct_pred += ((outputs >= 0.5 ) == (targets >= 0.5)).sum().item()
                     total_pred += targets.size(0)
     
                     # Backward pass and optimization
@@ -235,7 +236,7 @@ if __name__ == "__main__":
                 inputs, targets = inputs.to(device), targets.to(device)
     
                 # Forward pass
-                outputs = torch.sigmoid(model(inputs)) 
+                outputs = torch.sigmoid(model(inputs) / 3) 
     
                 # Store the outputs and targets
                 outputs_list.append(outputs.cpu().numpy())

@@ -16,6 +16,7 @@ from utils.nets.dcfnet import Conv1DModel
 from utils.data import BaseDataset, PairwiseDataset, load_dataset
 from utils.data import build_dataset
 from utils.processor import *
+from train_dcf import DFModel
 
 
 
@@ -130,16 +131,17 @@ def parse_args():
                         default = './cache', type = str,
                         help = "Directory to use to store cached feature files."
                     )
-    parser.add_argument('--drift_features',
-                        action='store_true',
-                        default=False)
+    #parser.add_argument('--drift_features',
+    #                    action='store_true',
+    #                    default=False)
     parser.add_argument('--host', 
                         default = False, action = 'store_true',
                         help = "Use hard triplet mining."
                     )
-    parser.add_argument(
-        '--temporal_alignment', action='store_true', help='Use temporal alignment loss'
-    )
+    parser.add_argument('--temporal_alignment', 
+                        action = 'store_true', 
+                        help = 'Use temporal alignment loss'
+                    )
 
     return parser.parse_args()
 
@@ -162,14 +164,14 @@ if __name__ == "__main__":
         resumed = torch.load(checkpoint_path)
         checkpoint_fname = os.path.basename(os.path.dirname(checkpoint_path))
     else:
-        print("Failed to load model checkpoint!")
+        print(f"Failed to load model checkpoint! {checkpoint_path}")
         sys.exit(-1)
     # else: checkpoint path and fname will be defined later if missing
 
     model_config = resumed['config']
     model_name = model_config.get('model', 'dcf')
     features = model_config['features']
-    feature_dim = model_config['feature_dim']
+    feature_dim = model_config.get('feature_dim', 64)
     inflow_size = model_config.get('inflow_size', 1000)
     outflow_size = model_config.get('outflow_size', 1000)
     
@@ -177,7 +179,10 @@ if __name__ == "__main__":
     if model_name.lower() == "espresso":
         inflow_fen = EspressoNet(**model_config)
     elif model_name.lower() == 'dcf':
-        inflow_fen = DFNet(feature_dim, len(features), **model_config)
+        #inflow_fen = Conv1DModel(feature_dim, len(features), 
+        #                         input_size=inflow_size)
+        inflow_fen = DFModel(input_shape=(len(features),1000), 
+                             emb_size=feature_dim)
     inflow_fen = inflow_fen.to(device)
     inflow_fen.load_state_dict(resumed['inflow_fen'])
     inflow_fen.eval()
@@ -186,8 +191,10 @@ if __name__ == "__main__":
         if model_name.lower() == "espresso":
             outflow_fen = EspressoNet(**model_config)
         elif model_name.lower() == "dcf":
-            outflow_fen = DFNet(feature_dim, len(features),
-                                **model_config)
+            #outflow_fen = Conv1DModel(feature_dim, len(features), 
+            #                          input_size=outflow_size)
+            outflow_fen = DFModel(input_shape=(len(features),1000), 
+                                  emb_size=feature_dim)
         outflow_fen = outflow_fen.to(device)
         outflow_fen.load_state_dict(resumed['outflow_fen'])
         outflow_fen.eval()
@@ -203,7 +210,12 @@ if __name__ == "__main__":
     pklpath = args.data
 
     # stream window definitions
-    #window_kwargs = model_config['window_kwargs']
+    window_kwargs = model_config.get('window_kwargs',{
+        "window_count": 11,
+        "window_width": 5,
+        "window_overlap": 3,
+        "include_all_window": False
+    })
     
     #if args.mode == 'same-host':
     #    # host
@@ -221,23 +233,23 @@ if __name__ == "__main__":
     #            'stream_ID_range': (1,float('inf')),
     #            }
         
-    idx = np.arange(0,10000)
+    if args.host:
+        out_idx = 2
+    else:
+        out_idx = -1
+    inflow, outflow, targets = build_dataset(pklpath, processor, 
+                                             inflow_size, outflow_size, 
+                                             in_idx = 1,
+                                             window_kwargs = window_kwargs,
+                                             )
+    outflow = np.array([x[out_idx] for x in outflow])
+    
+    idx = np.arange(0,min(10000,len(inflow)))
     np.random.seed(42)
     np.random.shuffle(idx)
     te_idx = idx[0:500]
     va_idx = idx[500:1000]
     tr_idx = idx[1000:10000]
-    
-    if args.host:
-        out_idx = 2
-        in_idx = 1
-    else:
-        out_idx = -1
-        in_idx = 1
-    inflow, outflow, targets = build_dataset(pklpath, processor, 
-                                             inflow_size, outflow_size, 
-                                             in_idx = in_idx)
-    outflow = np.array([x[out_idx] for x in outflow])
     va_inflow = inflow[va_idx]
     va_outflow = outflow[va_idx]
     te_inflow = inflow[te_idx]
@@ -276,16 +288,6 @@ if __name__ == "__main__":
     """
     """
     
-    # generate embeddings
-    def func(t):
-        """Custom func. to handle padding and batching samples for set_fen()"""
-        #t = torch.nn.utils.rnn.pad_sequence(t, 
-        #                                batch_first=True, 
-        #                                padding_value=0.)
-        t = torch.tensor(t).float()
-        t = t.unsqueeze(0)
-        #return t.permute(0,2,1).float().to(device)
-        return t.float().to(device)
     
     #va_data.set_fen(inflow_fen, func, outflow_fen = outflow_fen)
     #te_data.set_fen(inflow_fen, func, outflow_fen = outflow_fen)
@@ -294,8 +296,18 @@ if __name__ == "__main__":
         with torch.no_grad():
             embeds = []
             for flow in flows:
-                flow = func(flow)
-                embeds.append(fen(flow).detach().cpu()[0])
+                flow = torch.tensor(flow).float()
+                flow = flow.float().to(device)
+                if window_kwargs is None:
+                    flow = flow.unsqueeze(0)
+                    #flow = flow.view(flow.size(0)*flow.size(1), 
+                    #            flow.size(2), flow.size(3))
+                e = fen(flow)
+                if window_kwargs is not None:
+                    #e = e.view(1, flow.size(0), -1)
+                    e = e.unsqueeze(0)
+                embeds.append(e.detach().cpu()[0])
+        embeds = torch.stack(embeds)
         return embeds
     
     #def make_embeds(dataset, fen):
@@ -307,8 +319,8 @@ if __name__ == "__main__":
     #    return inflow_embeds, outflow_embeds
     
     va_inflow_embeds, va_outflow_embeds = make_embeds(va_inflow, inflow_fen), make_embeds(va_outflow, outflow_fen)
-    print(len(va_inflow_embeds), len(va_outflow_embeds))
     te_inflow_embeds, te_outflow_embeds = make_embeds(te_inflow, inflow_fen), make_embeds(te_outflow, outflow_fen)
+    print(va_inflow_embeds.shape, va_outflow_embeds.shape)
     #va_inflow_embeds, va_outflow_embeds = make_embeds(va_data, outflow_fen)
     #te_inflow_embeds, te_outflow_embeds = make_embeds(te_data, outflow_fen)
 
@@ -320,8 +332,6 @@ if __name__ == "__main__":
         sims = []
             
         #print(np.mean(avg_corr), np.mean(avg_uncorr))
-        inflow_embeds = torch.stack(inflow_embeds)
-        outflow_embeds = torch.stack(outflow_embeds)
         
         # Normalize embeddings
         #inflow_embeddings_norm = inflow_embeds / inflow_embeds.norm(dim=-1, keepdim=True)
@@ -371,7 +381,8 @@ if __name__ == "__main__":
 
             # Compute pairwise cosine similarity of windows
             all_sim = torch.bmm(in_emb.permute(1,0,2), out_emb.permute(1,2,0))
-            all_sim = all_sim.permute(1,2,0).reshape(-1, all_sim.shape[0])
+            window_count = all_sim.shape[0]
+            all_sim = all_sim.permute(1,2,0).reshape(-1, window_count)
 
             return all_sim
 
@@ -396,6 +407,7 @@ if __name__ == "__main__":
     
     va_sims, va_labels = build_sims(va_inflow_embeds, va_outflow_embeds)
     te_sims, te_labels = build_sims(te_inflow_embeds, te_outflow_embeds)
+    print(va_sims)
     
     
     """

@@ -5,16 +5,10 @@ import torch.nn.functional as F
 from torch import Tensor
 import numpy as np
 import sys
-import math
 import os
 from os.path import join
-import pickle as pkl
 from tqdm import tqdm
-from torchvision import transforms, utils
-import transformers
-import scipy
 import json
-import time
 import argparse
 from torch.utils.data import DataLoader, Dataset
 
@@ -22,7 +16,8 @@ from utils.nets.transdfnet import DFNet
 from utils.nets.espressonet import EspressoNet
 from utils.nets.dcfnet import Conv1DModel
 from utils.layers import Mlp
-from utils.data import BaseDataset, TripletDataset, PairwiseDataset
+from utils.data import BaseDataset, PairwiseDataset, load_dataset
+from utils.data import build_dataset, OnlineTripletDataset
 from utils.processor import DataProcessor
 from sklearn.metrics.pairwise import pairwise_distances
 
@@ -57,6 +52,10 @@ def parse_args():
                         type = str,
                         help = "Path to dataset pickle file.",
                         required = True)
+    parser.add_argument('--outfile',
+                        type=str,
+                        help = 'Output file for results.',
+                        required=True)
 
     return parser.parse_args()
 
@@ -79,11 +78,18 @@ if __name__ == "__main__":
         print("Failed to load model checkpoint!")
         sys.exit(-1)
     # else: checkpoint path and fname will be defined later if missing
+    
+    dirpath = os.path.dirname(args.outfile)
+    if not os.path.exists(dirpath):
+        os.makedirs(dirpath)
 
     model_config = resumed['config']
+    model_name = model_config.get('model', 'dcf')
     features = model_config['features']
     feature_dim = model_config['feature_dim']
-    model_name = model_config['model']
+    inflow_size = model_config.get('inflow_size', 1000)
+    outflow_size = model_config.get('outflow_size', 1000)
+    
     print(json.dumps(model_config, indent=4))
 
     # traffic feature extractor
@@ -122,170 +128,124 @@ if __name__ == "__main__":
 
     # multi-channel feature processor
     processor = DataProcessor(features)
-
-    pklpath = '../data/ssh/processed_nov17_fixtime.pkl'
-    #pklpath = '../data/ssh_socat/processed_nov30.pkl'
-
-    # chain-based sample splitting
-    te_idx = np.arange(0,1000)
-    va_idx = np.arange(1000,2000)
-
-    # stream window definitions
-    window_kwargs = model_config['window_kwargs']
-
-    # train dataloader
-    va_data = BaseDataset(pklpath, processor,
-                        window_kwargs = window_kwargs,
-                        preproc_feats = False,
-                        sample_idx = va_idx,
-                        host_only = True,
-                        #stream_ID_range = (1,float('inf'))
-                        #stream_ID_range = (0,1)
-                        )
-
-    # test dataloader
-    te_data = BaseDataset(pklpath, processor,
-                        window_kwargs = window_kwargs,
-                        preproc_feats = False,
-                        sample_idx = te_idx,
-                        host_only = True,
-                        #stream_ID_range = (1,float('inf')),
-                        #stream_ID_range = (0,1)
-                        )
-
-
-    def func(t):
-        t = torch.nn.utils.rnn.pad_sequence(t, 
-                                        batch_first=True, 
-                                        padding_value=0.)
-        return t.permute(0,2,1).float().to(device)
-
-    def make_embed_data(data):
-        all_embeds = []
-        all_labels = []
-        fen.eval()
-        with torch.no_grad():
-            for windows,chain_label,sample_ID in data:
-                windows = func(windows)
-                out = fen(windows)
-                out = head(out)
-                out = out.cpu().detach()
-                #chain_label = torch.tensor(chain_label)
-
-                all_embeds.append(out.flatten())
-                all_labels.append(chain_label)
-
-        return torch.stack(all_embeds), torch.stack(all_labels)
-
-
-    va_embeds, va_targets = make_embed_data(va_data)
-    te_embeds, te_targets = make_embed_data(te_data)
-
-    print(va_embeds.size(1))
-
-    # chain length prediction head
-    head = Mlp(dim=va_embeds.size(1), out_features=2)
-    head = head.to(device)
-
-    opt_lr          = 1e-3
-    opt_betas       = (0.9, 0.999)
-    opt_wd          = 0.001
-    optimizer = optim.AdamW(head.parameters(),
-            lr=opt_lr, betas=opt_betas, weight_decay=opt_wd)
-
-
-    # Create PyTorch datasets
-    class MyDataset(Dataset):
-        def __init__(self, inputs, targets):
-            self.inputs = inputs
-            self.targets = targets
-        def __len__(self):
-            return len(self.inputs)
-        def __getitem__(self, idx):
-            return self.inputs[idx], self.targets[idx]
-
-    va_dataset = MyDataset(va_embeds, va_targets)
-    te_dataset = MyDataset(te_embeds, te_targets)
     
-    # Create PyTorch dataloaders
+    idx = np.arange(0,10000)
+    np.random.seed(42)
+    np.random.shuffle(idx)
+    te_idx = idx[0:500]
+    va_idx = idx[500:1000]
+    tr_idx = idx[1000:10000]
+    
+    if args.host:
+        out_idx = 2
+        in_idx = 1
+    else:
+        out_idx = -1
+        in_idx = 1
+    inflow, outflow, targets = build_dataset(args.data, processor, 
+                                             inflow_size, outflow_size, 
+                                             in_idx = in_idx)
+    outflow = np.array([x[out_idx] for x in outflow])
+    va_inflow = inflow[va_idx]
+    va_outflow = outflow[va_idx]
+    va_targets = targets[va_idx]
+    te_inflow = inflow[te_idx]
+    te_outflow = outflow[te_idx]
+    te_targets = targets[te_idx]
+    print(va_inflow.shape, va_outflow.shape)
+    print(te_inflow.shape, te_outflow.shape)
+    
     batch_size = 128
-    va_loader = DataLoader(va_dataset, batch_size=batch_size, shuffle=True)
-    te_loader = DataLoader(te_dataset, batch_size=batch_size, shuffle=False)
-
-    criterion = nn.SmoothL1Loss(beta=1.0)
-
-    # Training loop
-    num_epochs = 100
-    for epoch in range(num_epochs):
-        # Training
-        fen.train()
-        running_loss = 0.0
-
-        up_acc = 0 
-        down_acc = 0
-        n = 0
-
-        for inputs, targets in tqdm(va_loader):
-            # Move tensors to the correct device
-            inputs, targets = inputs.to(device), targets.to(device)
-    
-            # Forward pass
-            pred = head(inputs)
-            loss = criterion(pred, targets.unsqueeze(1))
-
-            #
-            # accuracy predicted as all-or-nothing
-            #
-            length_pred = torch.round(pred[:,0])
-            up_acc += torch.sum(length_pred == targets[:,0]).item()
-
-            length_pred = torch.round(pred[:,1])
-            down_acc += torch.sum(length_pred == targets[:,1]).item()
-
-            acc = (up_acc + down_acc)/2
-            n += len(targets)
-            #
-            # # # # #
-    
-            # Backward pass and optimization
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-    
-            running_loss += loss.item()
-    
-        train_loss = running_loss / len(va_loader)
-        train_acc_up = up_acc / n
-        train_acc_down = down_acc / n
-        print(f'Epoch {epoch+1}/{num_epochs}, Train Loss: {train_loss:.4f}, Train Accuracy: {train_acc_up:.4f}|{train_acc_down:.4f}')
+    va_data = OnlineTripletDataset(va_inflow, va_outflow, va_targets)
+    valoader = DataLoader(
+        va_data,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=16,
+        pin_memory=True,
+    )
+    te_data = OnlineTripletDataset(te_inflow, te_outflow, te_targets)
+    teloader = DataLoader(
+        va_data,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=16,
+        pin_memory=True,
+    )
     
     
-    # Put the model in evaluation mode
-    head.eval()
+    def iter(dataloader, desc=""):
+        with tqdm(dataloader,
+                desc = desc,
+                dynamic_ncols = True) as pbar:
+            
+            n = 0
+            all_res = {'targets': [], 'preds': []}
+            for batch_idx, data in enumerate(pbar):
+
+                inflow_inputs, outflow_inputs, targets = data
+                targets = targets.to(device)
+                N = targets.size(0)
+                inflow_inputs = inflow_inputs.to(device)
+                outflow_inputs = outflow_inputs.to(device)
+                
+                # Apply FEN on flows
+                _, inflow_chain = inflow_fen(inflow_inputs, return_toks=True)
+                _, outflow_chain = outflow_fen(outflow_inputs, return_toks=True)
+                
+                concatenated = torch.concat((inflow_chain, outflow_chain), dim=-1)
+                pred = head(concatenated)
+                
+                all_res['targets'].append(targets.cpu().numpy())
+                all_res['preds'].append(pred.cpu().numpy())
+
+                up_pred = pred[:,1]
+                up_targets = targets[:,1]
+                up_length_pred = torch.round(up_pred)
+                up_acc += torch.sum(up_length_pred == up_targets).item()
+
+                down_pred = pred[:,0]
+                down_targets = targets[:,0]
+                down_length_pred = torch.round(down_pred)
+                down_acc += torch.sum(down_length_pred == down_targets).item()
+                
+                n += len(targets)
+                
+            all_targets = np.concatenate(all_res['targets'])
+            all_preds = np.concatenate(all_res['preds'])
+            all_error = all_targets - all_preds
+            print(f'Error: {np.mean(all_error):0.3f}|{np.std(all_error):0.3f}')
+            # up accuracy
+            print(f'Up accuracy: {up_acc/n:.4f}')
+            # down accuracy
+            print(f'Down accuracy: {down_acc/n:.4f}')
+        
+            metrics = {'up_acc': up_acc/n, 'down_acc': down_acc/n}
+            # add error and per-chain accuracy to metrics
+            metrics.update({'error': np.mean(all_error), 'error_std': np.std(all_error)})
+        
+            # for both up and down, print the accuracy calculated for each unique chain length
+            for chain_length in np.unique(all_targets[:,1]):
+                idx = all_targets[:,1] == chain_length
+                up_acc = np.sum(np.round(all_preds[idx,1]) == all_targets[idx,1]) / np.sum(idx)
+                print(f'Up accuracy for chain length {chain_length}: {up_acc:.4f}')
+                # print error
+                error = all_targets[idx,1] - all_preds[idx,1]
+                print(f'Error for chain length {chain_length}: {np.mean(error):0.3f}|{np.std(error):0.3f}')
+                metrics.update({f'up_acc_{chain_length}': up_acc, f'up_error_{chain_length}': np.mean(error), f'up_error_std_{chain_length}': np.std(error)})
+            for chain_length in np.unique(all_targets[:,0]):
+                idx = all_targets[:,0] == chain_length
+                down_acc = np.sum(np.round(all_preds[idx,0]) == all_targets[idx,0]) / np.sum(idx)
+                print(f'Down accuracy for chain length {chain_length}: {down_acc:.4f}')
+                # print error
+                error = all_targets[idx,0] - all_preds[idx,0]
+                print(f'Error for chain length {chain_length}: {np.mean(error):0.3f}|{np.std(error):0.3f}')
+                metrics.update({f'down_acc_{chain_length}': down_acc, f'down_error_{chain_length}': np.mean(error), f'down_error_std_{chain_length}': np.std(error)})
+
+    va_metrics = iter(valoader, desc="Validation")
+    te_metrics = iter(teloader, desc="Test")
     
-    up_acc = 0
-    down_acc = 0
-    n = 0
-    # Pass the validation data through the model
-    with torch.no_grad():
-        for inputs, targets in tqdm(te_loader):
-            # Move tensors to the correct device
-            inputs, targets = inputs.to(device), targets.to(device)
+    print(json.dumps(te_metrics, indent=4))
     
-            # Forward pass
-            pred = head(inputs)
-
-            #
-            # accuracy predicted as all-or-nothing
-            #
-            length_pred = torch.round(pred[:,0])
-            up_acc += torch.sum(length_pred == targets[:,0]).item()
-
-            length_pred = torch.round(pred[:,1])
-            down_acc += torch.sum(length_pred == targets[:,1]).item()
-
-            acc = (up_acc + down_acc)/2
-            n += len(targets)
-            #
-            # # # # #
-    print(f'Test Accuracy: {up_acc / n:.4f}|{down_acc / n:.4f}')
+    with open(args.outfile, 'w') as f:
+        json.dump(te_metrics, f, indent=4)

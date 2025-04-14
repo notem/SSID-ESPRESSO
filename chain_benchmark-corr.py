@@ -152,15 +152,6 @@ if __name__ == "__main__":
     y_pred = np.concatenate(y_pred)
     labels = np.concatenate(labels)
     
-    # Save the results for posterity
-    results = {
-        'y_pred': y_pred,
-        'labels': labels,
-    }
-    with open(args.results_file, 'wb') as fo:
-        pickle.dump(results, fo)
-    print(f"Results saved to {args.results_file}")
-    
     # Evaluate the results
     fpr, tpr, thresholds = metrics.roc_curve(labels[:,0], y_pred)
     roc_auc = metrics.auc(fpr, tpr)
@@ -168,7 +159,7 @@ if __name__ == "__main__":
     
     # Interpolate to get the corresponding thresholds
     num_thresholds = 50
-    sampled_thresholds = np.linspace(0, 1, num_thresholds)
+    sampled_thresholds = np.linspace(0, 1, num_thresholds, endpoint=False)
     #sampled_thresholds = np.interp(sampled_fpr, fpr[::-1], thresholds[::-1])
 
     # Now evaluate your custom metrics at these thresholds
@@ -234,16 +225,32 @@ if __name__ == "__main__":
         
         custom_metrics[threshold] = {
             'precision': avg_precision,
+            'stdev_precision': stdev_precision,
             'recall': avg_recall,
+            'stdev_recall': stdev_recall,
             'fpr': avg_fpr,
+            'stdev_fpr': stdev_fpr,
             'f1': avg_f1,
+            'stdev_f1': stdev_f1,
             'chain-accuracy': percent_chains,
             'per-chain': per_chain_results,
         }
         
         print(f"Threshold: {threshold:.2f} " +
-              f"| Precision: {avg_precision:.3f}±{stdev_precision:0.2f} " +
               f"| Recall: {avg_recall:.3f}±{stdev_recall:0.2f} " +
               f"| FPR: {avg_fpr:.3f}±{stdev_fpr:0.2f} " +
               f"| F1: {avg_f1:.3f}±{stdev_f1:0.2f} " +
-              f"| Chains: {percent_chains:.3f}")
+              f"| Chain Acc.: {percent_chains:.3f}")
+              #f"| Precision: {avg_precision:.3f}±{stdev_precision:0.2f} " +
+        
+    # save results
+    results = {
+        'fpr': fpr,
+        'tpr': tpr,
+        'roc_auc': roc_auc,
+        'custom_metrics': custom_metrics,
+        'labels': labels,
+        'preds': y_pred,
+    }
+    with open(args.results_file, 'wb') as fi:
+        pickle.dump(results, fi)

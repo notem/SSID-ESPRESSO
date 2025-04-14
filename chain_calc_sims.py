@@ -14,8 +14,9 @@ from utils.nets.transdfnet import DFNet
 from utils.nets.espressonet import EspressoNet
 from utils.nets.dcfnet import Conv1DModel
 from utils.data import BaseDataset, PairwiseDataset, load_dataset
-from utils.data import build_dataset
+from utils.data import build_dataset, create_windows
 from utils.processor import *
+from train_dcf import DFModel
 
 
 # Hack in istarmap to multiprocessing for Python 3.8+
@@ -145,22 +146,9 @@ def parse_args():
                         type = str,
                         help = "Resume from checkpoint path.", 
                         required = True)
-    parser.add_argument('--mode', 
-                        type = str,
-                        default = 'network-ends',
-                        choices=['same-host','network-ends','network-all'],
-                        help = "Resume from checkpoint path.", 
-                        )
     parser.add_argument('--cache_dir',
                         default = './cache', type = str,
                         help = "Directory to use to store cached feature files."
-                    )
-    parser.add_argument('--drift_features',
-                        action='store_true',
-                        default=False)
-    parser.add_argument('--host', 
-                        default = False, action = 'store_true',
-                        help = "Use hard triplet mining."
                     )
     parser.add_argument(
         '--temporal_alignment', action='store_true', help='Use temporal alignment loss'
@@ -202,7 +190,9 @@ if __name__ == "__main__":
     if model_name.lower() == "espresso":
         inflow_fen = EspressoNet(**model_config)
     elif model_name.lower() == 'dcf':
-        inflow_fen = DFNet(feature_dim, len(features), **model_config)
+        #inflow_fen = DFNet(feature_dim, len(features), **model_config)
+        inflow_fen = DFModel(input_shape=(len(features),1000), 
+                             emb_size=feature_dim)
     inflow_fen = inflow_fen.to(device)
     inflow_fen.load_state_dict(resumed['inflow_fen'])
     inflow_fen.eval()
@@ -211,8 +201,10 @@ if __name__ == "__main__":
         if model_name.lower() == "espresso":
             outflow_fen = EspressoNet(**model_config)
         elif model_name.lower() == "dcf":
-            outflow_fen = DFNet(feature_dim, len(features),
-                                **model_config)
+            #outflow_fen = DFNet(feature_dim, len(features),
+            #                    **model_config)
+            outflow_fen = DFModel(input_shape=(len(features),1000), 
+                                  emb_size=feature_dim)
         outflow_fen = outflow_fen.to(device)
         outflow_fen.load_state_dict(resumed['outflow_fen'])
         outflow_fen.eval()
@@ -226,6 +218,13 @@ if __name__ == "__main__":
     # multi-channel feature processor
     processor = DataProcessor(features, **model_config)
     pklpath = args.data
+    
+    window_kwargs = model_config.get('window_kwargs',{
+        "window_count": 11,
+        "window_width": 5,
+        "window_overlap": 3,
+        "include_all_window": False
+    })
 
     # stream window definitions
     #window_kwargs = model_config['window_kwargs']
@@ -249,20 +248,43 @@ if __name__ == "__main__":
     # Helper function to process a single chain
     def process_chain(i, chain, size, processor):
         target = len(chain) - 2
-        s = [processor(chain[j]) for j in range(1, len(chain)-1)]
+        
+        if isinstance(chain[1], list):
+            s = [[processor(chain[j][k]) for k in range(len(chain[j]))] 
+                    for j in range(1, len(chain))]
+            
+            for j in range(len(s)):
+                for k in range(len(s[j])):
+                    if len(s[j][k]) < size:
+                        s[j][k] = np.pad(s[j][k], ((0, size - len(s[j][k])), (0, 0)))
+                    else:
+                        s[j][k] = s[j][k][:size]
+        else:
+            s = [processor(chain[j]) for j in range(1, len(chain)-1)]
 
-        # Pad or trim each element in s2 to match outflow_size
-        for j in range(len(s)):
-            if len(s[j]) < size:
-                s[j] = np.pad(s[j], ((0, size - len(s[j])), (0, 0)))
-            else:
-                s[j] = s[j][:size]
+            # Pad or trim each element in s2 to match outflow_size
+            for j in range(len(s)):
+                if len(s[j]) < size:
+                    s[j] = np.pad(s[j], ((0, size - len(s[j])), (0, 0)))
+                else:
+                    s[j] = s[j][:size]
 
         return s, target
 
     def build_dataset(pklpath, processor, size, n_jobs=8):
         # load_dataset must be defined elsewhere
         chains = load_dataset(pklpath)
+        
+        if window_kwargs is not None:
+            windowized_chains = []
+            for chain in chains:
+                sample_windows = []
+                for sample in chain:
+                    times = sample[:, 0]
+                    windows = create_windows(times, sample, **window_kwargs)
+                    sample_windows.append(windows)
+                windowized_chains.append(sample_windows)
+            chains = windowized_chains
 
         # Prepare arguments for each chain; limit to 10000 chains
         tasks = []
@@ -277,7 +299,7 @@ if __name__ == "__main__":
         with mpp.Pool(min(cpu_count(), n_jobs)) as pool:
             for s2, t in tqdm(pool.istarmap(process_chain, tasks, chunksize=16), 
                                   total = len(tasks)):
-                flows.append(np.stack(s2).transpose((0,2,1)))
+                flows.append(np.stack(s2))#.transpose((0,2,1)))
                 chain_id.append(np.ones(len(s2))*j)
                 host_id.append(np.arange(len(s2))//2)
                 j += 1
@@ -287,12 +309,20 @@ if __name__ == "__main__":
         #flows = np.array([np.stack(samples).transpose((0, 2, 1)) for samples in flows], dtype=object)
         #flows = np.stack(flows).transpose((0, 2, 1))
         #targets = np.array(targets)
+        if window_kwargs is not None:
+            # Stack and transpose as needed
+            flows = np.array([np.stack(samples).transpose((0, 1, 3, 2)) for samples in flows], dtype=object)
+        else:
+            flows = np.array([np.stack(samples).transpose((0, 2, 1)) for samples in flows], dtype=object)
 
-        return np.array(flows,dtype=object), np.array(chain_id,dtype=object), np.array(host_id,dtype=object)
+        #targets = np.array(targets,dtype=object)
+
+        return flows, np.array(chain_id,dtype=object), np.array(host_id, dtype=object)
+        #return np.array(flows,dtype=object), np.array(chain_id,dtype=object), np.array(host_id,dtype=object)
 
     flows, chain_id, host_id = build_dataset(pklpath, processor, max(inflow_size, outflow_size))
     
-    idx = np.arange(0,10000)
+    idx = np.arange(0,min(10000, len(flows)))
     np.random.seed(42)
     np.random.shuffle(idx)
     te_idx = idx[0:500]
@@ -327,12 +357,29 @@ if __name__ == "__main__":
     #va_data.set_fen(inflow_fen, func, outflow_fen = outflow_fen)
     #te_data.set_fen(inflow_fen, func, outflow_fen = outflow_fen)
     
+    #def make_embeds(flows, fen):
+    #    with torch.no_grad():
+    #        embeds = []
+    #        for flow in flows:
+    #            flow = func(flow)
+    #            embeds.append(fen(flow).detach().cpu()[0])
+    #    return embeds
     def make_embeds(flows, fen):
         with torch.no_grad():
             embeds = []
             for flow in flows:
-                flow = func(flow)
-                embeds.append(fen(flow).detach().cpu()[0])
+                flow = torch.tensor(flow).float()
+                flow = flow.float().to(device)
+                if window_kwargs is None:
+                    flow = flow.unsqueeze(0)
+                    #flow = flow.view(flow.size(0)*flow.size(1), 
+                    #            flow.size(2), flow.size(3))
+                e = fen(flow)
+                if window_kwargs is not None:
+                    #e = e.view(1, flow.size(0), -1)
+                    e = e.unsqueeze(0)
+                embeds.append(e.detach().cpu()[0])
+        embeds = torch.stack(embeds)
         return embeds
     
     #def make_embeds(dataset, fen):
@@ -353,8 +400,8 @@ if __name__ == "__main__":
         """
         sims = []
             
-        inflow_embeds = torch.stack(inflow_embeds)
-        outflow_embeds = torch.stack(outflow_embeds)
+        #inflow_embeds = torch.stack(inflow_embeds)
+        #outflow_embeds = torch.stack(outflow_embeds)
         
         def compute_sim(in_emb, out_emb):
             """
@@ -368,7 +415,7 @@ if __name__ == "__main__":
 
             # Compute pairwise cosine similarity of windows
             all_sim = torch.bmm(in_emb.permute(1,0,2), out_emb.permute(1,2,0))
-            all_sim = all_sim.permute(1,2,0)#.reshape(-1, all_sim.shape[0])
+            all_sim = all_sim.permute(1,2,0)
 
             return all_sim
 

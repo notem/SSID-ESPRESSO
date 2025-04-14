@@ -872,6 +872,8 @@ def load_dataset(filepath, idx_selector=None, zero_time=False):
         sample = data[s_idx]
         host_IDs = sorted(list(sample.keys()))
         #protocols = data_protocols[s_idx]
+        if len(host_IDs) > 5:
+            continue
 
         # first and last hosts represent the attacker's machine and target endpoint of the chain respectively
         # these hosts should contain only one SSH stream in their sample
@@ -901,27 +903,60 @@ def load_dataset(filepath, idx_selector=None, zero_time=False):
 # Helper function to process a single chain
 def process_chain(i, chain, in_idx, inflow_size, outflow_size, processor):
     target = len(chain) - 2
-    s1 = processor(chain[in_idx])
-    s2 = [processor(chain[j]) for j in range(in_idx, len(chain))]
-
-    # Pad or trim s1 to match inflow_size
-    if len(s1) < inflow_size:
-        s1 = np.pad(s1, ((0, inflow_size - len(s1)), (0, 0)))
+    # check if inner element is list
+    if isinstance(chain[in_idx][0], list):
+        # chain contains samples as sequence of traffic windows
+        s1 = [processor(chain[in_idx][j]) for j in range(len(chain[in_idx]))]
+        s2 = [[processor(chain[j][k]) for k in range(len(chain[j]))] 
+                for j in range(in_idx, len(chain))]
+        
+        # apply padding to feature windows
+        for j in range(len(s1)):
+            if len(s1[j]) < inflow_size:
+                s1[j] = np.pad(s1[j], ((0, inflow_size - len(s1[j])), (0, 0)))
+            else:
+                s1[j] = s1[j][:inflow_size]
+        for j in range(len(s2)):
+            for k in range(len(s2[j])):
+                if len(s2[j][k]) < outflow_size:
+                    s2[j][k] = np.pad(s2[j][k], ((0, outflow_size - len(s2[j][k])), (0, 0)))
+                else:
+                    s2[j][k] = s2[j][k][:outflow_size]
     else:
-        s1 = s1[:inflow_size]
+        # non-windowized samples
+        s1 = processor(chain[in_idx])
+        s2 = [processor(chain[j]) for j in range(in_idx, len(chain))]
 
-    # Pad or trim each element in s2 to match outflow_size
-    for j in range(len(s2)):
-        if len(s2[j]) < outflow_size:
-            s2[j] = np.pad(s2[j], ((0, outflow_size - len(s2[j])), (0, 0)))
+        # Pad or trim s1 to match inflow_size
+        if len(s1) < inflow_size:
+            s1 = np.pad(s1, ((0, inflow_size - len(s1)), (0, 0)))
         else:
-            s2[j] = s2[j][:outflow_size]
+            s1 = s1[:inflow_size]
+
+        # Pad or trim each element in s2 to match outflow_size
+        for j in range(len(s2)):
+            if len(s2[j]) < outflow_size:
+                s2[j] = np.pad(s2[j], ((0, outflow_size - len(s2[j])), (0, 0)))
+            else:
+                s2[j] = s2[j][:outflow_size]
 
     return s1, s2, target
 
-def build_dataset(pklpath, processor, inflow_size, outflow_size, in_idx=1, n_jobs=8):
+def build_dataset(pklpath, processor, inflow_size, outflow_size, 
+                  in_idx=1, n_jobs=8, window_kwargs=None):
     # load_dataset must be defined elsewhere
     chains = load_dataset(pklpath)
+    
+    if window_kwargs is not None:
+        windowized_chains = []
+        for chain in chains:
+            sample_windows = []
+            for sample in chain:
+                times = sample[:, 0]
+                windows = create_windows(times, sample, **window_kwargs)
+                sample_windows.append(windows)
+            windowized_chains.append(sample_windows)
+        chains = windowized_chains
 
     # Prepare arguments for each chain; limit to 10000 chains
     tasks = []
