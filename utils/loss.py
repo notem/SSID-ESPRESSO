@@ -15,7 +15,7 @@ class TripletLoss(nn.Module):
         loss = F.relu(pos_dist - neg_dist + self.margin)
         return loss.mean()
 
-class CosineTripletLoss(nn.Module):
+class CosineTripletLoss_old(nn.Module):
     def __init__(self, margin=0.1):
         super(CosineTripletLoss, self).__init__()
         self.margin = margin
@@ -203,12 +203,24 @@ def compute_sim(in_emb, out_emb, mean=True):
     if in_emb.dim() == 2:       # DCF-style output
         all_sim = torch.mm(in_emb, out_emb.t())
     elif in_emb.dim() == 3:     # ESPRESSO-style output
-        #all_sim = torch.matmul(in_emb.permute(1,0,2), out_emb.permute(1,2,0))
         all_sim = torch.bmm(in_emb.permute(1,0,2), out_emb.permute(1,2,0))
         if mean:
             all_sim = all_sim.mean(0)  # mean across the window dim (otherwise hard-mining performs very poorly)
 
     return all_sim
+
+
+class CosineTripletLoss(nn.Module):
+    def __init__(self, margin=0.1):
+        super(CosineTripletLoss, self).__init__()
+        self.margin = margin
+
+    def forward(self, anchor, positive, negative):
+        pos_sim = torch.diag(compute_sim(anchor, positive))
+        neg_sim = torch.diag(compute_sim(anchor, negative))
+        loss = F.relu(neg_sim - pos_sim + self.margin)
+        return loss
+        return loss.mean()
 
 
 class OnlineCosineTripletLoss(nn.Module):

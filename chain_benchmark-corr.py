@@ -137,14 +137,14 @@ if __name__ == "__main__":
             cur_batch_x.append(sample)
             if len(cur_batch_x) >= te_batch_size:
                 batch = torch.stack(cur_batch_x, dim=0).to(torch.float32)
-                batch_probs = torch.sigmoid(model(batch))
+                batch_probs = torch.sigmoid(model(batch) / 3)
                 y_pred.append(batch_probs.cpu().detach().numpy())
                 labels.append(np.array(cur_batch_labels))
                 cur_batch_x = []
                 cur_batch_labels = []
     if len(cur_batch_x) > 0:
         batch = torch.stack(cur_batch_x, dim=0).to(torch.float32)
-        batch_probs = torch.sigmoid(model(batch))
+        batch_probs = torch.sigmoid(model(batch) / 3)
         y_pred.append(batch_probs.cpu().detach().numpy())
         labels.append(np.array(cur_batch_labels))
     
@@ -159,8 +159,13 @@ if __name__ == "__main__":
     
     # Interpolate to get the corresponding thresholds
     num_thresholds = 50
-    sampled_thresholds = np.linspace(0, 1, num_thresholds, endpoint=False)
+    #sampled_thresholds = np.linspace(0, 1, num_thresholds, endpoint=False)
     #sampled_thresholds = np.interp(sampled_fpr, fpr[::-1], thresholds[::-1])
+    target_fprs = np.logspace(np.log10(max(np.amin(fpr),1e-6) + 1e-10), 
+                              np.log10(np.amax(fpr) + 1e-10), 
+                              num_thresholds) - 1e-10
+    sampled_thresholds = np.interp(target_fprs, fpr, thresholds)[::-1]
+    sampled_thresholds = np.where(np.isinf(sampled_thresholds), 1, sampled_thresholds)
 
     # Now evaluate your custom metrics at these thresholds
     custom_metrics = {}
@@ -237,9 +242,9 @@ if __name__ == "__main__":
         }
         
         print(f"Threshold: {threshold:.2f} " +
-              f"| Recall: {avg_recall:.3f}±{stdev_recall:0.2f} " +
-              f"| FPR: {avg_fpr:.3f}±{stdev_fpr:0.2f} " +
-              f"| F1: {avg_f1:.3f}±{stdev_f1:0.2f} " +
+              f"| Recall: {avg_recall:.3f}±{stdev_recall:0.3f} " +
+              f"| FPR: {avg_fpr:.5f}±{stdev_fpr:0.5f} " +
+              f"| F1: {avg_f1:.3f}±{stdev_f1:0.3f} " +
               f"| Chain Acc.: {percent_chains:.3f}")
               #f"| Precision: {avg_precision:.3f}±{stdev_precision:0.2f} " +
         

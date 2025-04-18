@@ -82,7 +82,7 @@ def parse_args():
     parser.add_argument('--bs', type=int, default=128, help="Batch size for training.")
     parser.add_argument('--margin', type=float, default=0.1, help="Margin for the triplet loss function.")
     parser.add_argument('--learning_rate', type=float, default=0.0001, help="Initial learning rate.")
-    parser.add_argument('--num_epochs', type=int, default=500, help="Number of epochs to train.")
+    parser.add_argument('--num_epochs', type=int, default=1000, help="Number of epochs to train.")
     parser.add_argument('--model_name', type=str, default='final.pth', help="Name of the saved model file.")
     parser.add_argument('--ckpt_dir',
                         default = './checkpoint',
@@ -102,6 +102,12 @@ def parse_args():
     parser.add_argument('--single_fen', 
                         default = False, action = 'store_true',
                         help = 'Use the same FEN for in and out flows.')
+    parser.add_argument('--multi_feats', 
+                        default = False, action = 'store_true',
+                        help = 'Use multiple packet-based feature representations.')
+    parser.add_argument('--interval_feats', 
+                        default = False, action = 'store_true',
+                        help = 'Use time interval-based feature representations.')
     return parser.parse_args()
  
 # Define the learning rate schedule function
@@ -125,49 +131,48 @@ class CosineTripletLoss(nn.Module):
         loss = F.relu(neg_sim - pos_sim + self.margin)
         return torch.mean(loss,dim=-1)
  
-class QuadrupleSampler(Sampler):
-    def __init__(self, data_source):
-        self.data_source = data_source
-    
-    def __iter__(self):
-        indices = list(range(len(self.data_source))) * 4
-        np.random.shuffle(indices)
-        return iter(indices)
-    
-    def __len__(self):
-        return 4 * len(self.data_source)
- 
 def main():
     args = parse_args()
  
-    features = ['dcf']
-    features = ('inv_iat_logs', 'iats', 
-                'sizes', 'burst_edges', 'running_rates', 
-                'cumul_norm', 'times_norm')
-    input_size = 1000
-    features = (
-        "interval_dirs_up",
-        "interval_dirs_down",
-        "interval_dirs_sum",
-        "interval_dirs_sub",
-        "interval_size_up",
-        "interval_size_down",
-        "interval_size_sum",
-        "interval_size_sub",
-        "interval_iats",
-        "interval_inv_iat_logs",
-        "interval_cumul_norm",
-        "interval_times_norm"
-        )
-    input_size = 200
-    processor = DataProcessor(features)
-
     window_kwargs = {
         "window_count": 11,
-        "window_width": 5,
-        "window_overlap": 3,
-        "include_all_window": True
+        "window_width": 8,
+        "window_overlap": 4,
+        "include_all_window": False,
+        "adjust_times": True,
     }
+    features = ['dcf']
+    input_size = 1000
+    
+    if args.multi_feats:
+        features = ('inv_iat_logs', 
+                    'iats', 
+                    'sizes', 
+                    'burst_edges', 
+                    'running_rates', 
+                    'cumul_norm', 
+                    'times_norm')
+    
+    if args.interval_feats:
+        features = (
+            "interval_dirs_up",
+            "interval_dirs_down",
+            "interval_dirs_sum",
+            "interval_dirs_sub",
+            "interval_size_up",
+            "interval_size_down",
+            "interval_size_sum",
+            "interval_size_sub",
+            "interval_iats",
+            "interval_inv_iat_logs",
+            "interval_cumul_norm",
+            "interval_times_norm"
+            )
+        input_size = 200
+        window_kwargs["adjust_times"] = False
+        
+    processor = DataProcessor(features)
+
     inflow, outflow, _ = build_dataset(args.data, processor, 
                                              input_size, input_size, in_idx=1, 
                                              window_kwargs = window_kwargs,
@@ -189,15 +194,10 @@ def main():
     val_dataset = TripletDataset(val_inflows, val_outflows, 
                                  as_window = not args.batched_windows)
  
-    train_sampler = QuadrupleSampler(train_dataset)
-    val_sampler = QuadrupleSampler(val_dataset)
- 
     # Create the dataloaders
     train_loader = DataLoader(train_dataset, batch_size=args.bs, 
-                              #sampler=train_sampler
                               )
     val_loader = DataLoader(val_dataset, batch_size=args.bs, 
-                            #sampler=val_sampler
                             )
  
     # Instantiate the models
@@ -338,6 +338,8 @@ def main():
                             'features': features,
                             'window_kwargs': window_kwargs,
                             'feature_dim': 64,
+                            'inflow_size': input_size,
+                            'outflow_size': input_size,
                         },
                 'inflow_fen': inflow_model.state_dict(),
                 'outflow_fen': outflow_model.state_dict(),

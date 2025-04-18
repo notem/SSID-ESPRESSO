@@ -185,7 +185,7 @@ if __name__ == "__main__":
             with tqdm(total=len(tr_loader)) as pbar:
                 for i, (inputs, targets) in enumerate(tr_loader):
                     # Move tensors to the correct device
-                    margin = 0.15  # soft-loss to avoid overfitting (improves model's ability to reach very low FPR values)
+                    margin = 0.25  # soft-loss to avoid overfitting (improves model's ability to reach very low FPR values)
                     targets = torch.clip(targets, min=margin, max=1-margin)
                     #targets += (torch.rand_like(targets) - 0.5) * margin * 2
                     inputs, targets = inputs.to(device), targets.to(device)

@@ -37,15 +37,27 @@ def istarmap(self, func, iterable, chunksize=1):
 
 mpp.Pool.istarmap = istarmap
 
+def get_split_idx(available=10000, limit=10000):
+    """Get indices for train, validation, and test splits using a fixed seed 
+        for the same split and reproducibility between scripts.
+    """
+    idx = np.arange(0, min(available, limit))
+    np.random.seed(42)
+    np.random.shuffle(idx)
+    te_idx = idx[0:500]
+    va_idx = idx[500:1000]
+    tr_idx = idx[1000:10000]
+    return te_idx, va_idx, tr_idx
 
 class TripletDataset(data.Dataset):
-    def __init__(self, inflow_data, outflow_data, chain_targets):
+    def __init__(self, inflow_data, outflow_data, chain_targets=None, as_window=False):
         self.positive_top = True
         self.inflow_data = inflow_data
         self.outflow_data = outflow_data
         self.all_indices = list(range(len(self.inflow_data)))
         random.shuffle(self.all_indices)
         self.chain_targets = chain_targets
+        self.as_windows = as_window
 
         # Divide the shuffled indices into two partitions
         cutoff = len(self.all_indices) // 2
@@ -72,7 +84,30 @@ class TripletDataset(data.Dataset):
         sample_idx = torch.randint(low=0, high=len(self.outflow_data[negative_idx]), size=(1,), dtype=torch.int32)
         negative = self.outflow_data[negative_idx][sample_idx]
         
-        target = torch.tensor([sample_idx, len(self.outflow_data[negative_idx])-sample_idx], dtype=torch.float32) 
+        if self.as_windows:
+            window_idx = torch.randint(low=0, high=len(anchor), size=(1,), dtype=torch.int32)
+            anchor = anchor[window_idx]
+            positive = positive[window_idx]
+            negative = negative[window_idx]
+            
+            #negative_window = None
+            #max_iter = 20
+            #i = 0
+            #while negative_window is None or len(negative_window) == 0 or i == max_iter:
+            #    window_idx = torch.randint(low=0, high=len(negative), size=(1,), dtype=torch.int32)
+            #    negative_window = negative[window_idx]
+            #    i += 1
+            #negative = negative_window
+        
+        if self.chain_targets is not None:
+            target = torch.tensor([sample_idx, len(self.outflow_data[negative_idx])-sample_idx], dtype=torch.float32) 
+            return (
+                torch.tensor(anchor, dtype=torch.float32),
+                torch.tensor(positive, dtype=torch.float32),
+                torch.tensor(negative, dtype=torch.float32),
+                target,
+            )
+
         
         #positive = self.outflow_data[idx]
         #target = self.chain_targets[idx]
@@ -82,9 +117,8 @@ class TripletDataset(data.Dataset):
             torch.tensor(anchor, dtype=torch.float32),
             torch.tensor(positive, dtype=torch.float32),
             torch.tensor(negative, dtype=torch.float32),
-            target,
         )
-
+        
     def reset_split(self):
         self.positive_top = not self.positive_top
 
@@ -98,7 +132,7 @@ class TripletDataset(data.Dataset):
 
 
 class OnlineTripletDataset(data.Dataset):
-    def __init__(self, inflow_data, outflow_data, chain_targets):
+    def __init__(self, inflow_data, outflow_data, chain_targets, as_window=False):
         self.positive_top = True
         self.inflow_data = inflow_data
         self.outflow_data = outflow_data
@@ -106,6 +140,7 @@ class OnlineTripletDataset(data.Dataset):
         random.shuffle(self.all_indices)
         self.size = len(self.all_indices)
         self.chain_targets = chain_targets
+        self.as_window = as_window
 
     def __len__(self):
         return len(self.inflow_data)
@@ -117,6 +152,12 @@ class OnlineTripletDataset(data.Dataset):
         
         sample_idx = torch.randint(low=0, high=len(self.outflow_data[trace_idx]), size=(1,), dtype=torch.int32)
         positive = self.outflow_data[trace_idx][sample_idx]
+        
+        if self.as_window:
+            window_idx = torch.randint(low=0, high=len(anchor), size=(1,), dtype=torch.int32)
+            anchor = anchor[window_idx]
+            positive = positive[window_idx]
+        
         target = torch.tensor([sample_idx, len(self.outflow_data[trace_idx])-sample_idx], dtype=torch.float32) 
         #self.chain_targets[trace_idx]
 
@@ -642,7 +683,8 @@ class OfflineDataset(BaseDataset):
         # pad and fix dimension
         batch_x_tensors = []
         for batch_x_n in batch_x:
-            batch_x_n = torch.nn.utils.rnn.pad_sequence([torch.tensor(x) for x in batch_x_n], batch_first=True, padding_value=0.)
+            batch_x_n = torch.nn.utils.rnn.pad_sequence([torch.tensor(x) for x in batch_x_n], 
+                                                        batch_first=True, padding_value=0.)
             if len(batch_x_n.shape) < 3:  # add channel dimension if missing
                 batch_x_n = batch_x_n.unsqueeze(-1)
             batch_x_n = batch_x_n.permute(0,2,1)
@@ -750,9 +792,9 @@ class OnlineDataset(BaseDataset):
 def create_windows(times, features,
                     window_width = 5,
                     window_count = 11,
-                    window_overlap = 2,
+                    window_overlap = 3,
                     include_all_window = False,
-                    adjust_times = True,
+                    adjust_times = False,
                 ):
     """
     Slice a sample's full stream into time-based windows.
@@ -776,7 +818,7 @@ def create_windows(times, features,
         window_count -= 1
 
     if window_count > 0:
-        window_step = min(window_width - window_overlap, 1)
+        window_step = max(window_width - window_overlap, 1)
 
         # Create overlapping windows
         for start in np.arange(0, stop = window_count * window_step, 
@@ -784,13 +826,13 @@ def create_windows(times, features,
 
             end = start + window_width
 
-            #window_idx = torch.where(torch.logical_and(times >= start, times < end))[0]
-            #window_features.append(features[window_idx])
-            # Find the indices for the current window range [start, end)
-            left_idx = np.searchsorted(times.squeeze(), start, side='left')
-            right_idx = np.searchsorted(times.squeeze(), end, side='left')
-            # Slice out the timestamps for this window
-            window = features[left_idx:right_idx]
+            window_idx = np.where(np.logical_and(times >= start, times < end))[0]
+            window = features[window_idx]
+            ## Find the indices for the current window range [start, end)
+            #left_idx = np.searchsorted(times.squeeze(), start, side='left')
+            #right_idx = np.searchsorted(times.squeeze(), end, side='left')
+            ## Slice out the timestamps for this window
+            #window = features[left_idx:right_idx]
             
             if adjust_times:
                 window[:,0] -= start
@@ -853,6 +895,8 @@ def load_dataset(filepath, idx_selector=None, zero_time=False):
     with open(filepath, "rb") as fi:
         all_data = pickle.load(fi)
 
+    if all_data.get('obfs', False):
+        return all_data['chains']   # data is already organized into the expected nested list format
 
     IP_info = all_data['IPs']   # extra src. & dst. IP info available for each stream
     data = all_data['data']     # stream metadata organized by sample and hosts (per sample)
@@ -904,7 +948,7 @@ def load_dataset(filepath, idx_selector=None, zero_time=False):
 def process_chain(i, chain, in_idx, inflow_size, outflow_size, processor):
     target = len(chain) - 2
     # check if inner element is list
-    if isinstance(chain[in_idx][0], list):
+    if isinstance(chain[in_idx], list):
         # chain contains samples as sequence of traffic windows
         s1 = [processor(chain[in_idx][j]) for j in range(len(chain[in_idx]))]
         s2 = [[processor(chain[j][k]) for k in range(len(chain[j]))] 
@@ -974,9 +1018,14 @@ def build_dataset(pklpath, processor, inflow_size, outflow_size,
             outflow.append(s2)
             targets.append(t)
 
-    # Stack and transpose as needed
-    inflow = np.stack(inflow).transpose((0, 2, 1))
-    outflow = np.array([np.stack(samples).transpose((0, 2, 1)) for samples in outflow], dtype=object)
+    if window_kwargs is not None:
+        # Stack and transpose as needed
+        inflow = np.stack(inflow).transpose((0, 1, 3, 2))
+        outflow = np.array([np.stack(samples).transpose((0, 1, 3, 2)) for samples in outflow], dtype=object)
+    else:
+        inflow = np.stack(inflow).transpose((0, 2, 1))
+        outflow = np.array([np.stack(samples).transpose((0, 2, 1)) for samples in outflow], dtype=object)
+        
     targets = np.array(targets)
 
     return inflow, outflow, targets
@@ -1006,9 +1055,9 @@ if __name__ == "__main__":
 
         # build base dataset object
         data = BaseDataset(pklpath, processor,
-                              window_kwargs = window_kwargs,
-                              sample_idx = idx,
-                              stream_ID_range = (0,1))
+                            window_kwargs = window_kwargs,
+                            sample_idx = idx,
+                            stream_ID_range = (0,1))
         print(f'Streams: {len(data)}')
         for windows, chain_label, sample_ID in data:
             pass

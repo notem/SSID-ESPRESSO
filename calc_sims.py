@@ -171,9 +171,10 @@ if __name__ == "__main__":
     model_config = resumed['config']
     model_name = model_config.get('model', 'dcf')
     features = model_config['features']
+    input_size = 200
     feature_dim = model_config.get('feature_dim', 64)
-    inflow_size = model_config.get('inflow_size', 1000)
-    outflow_size = model_config.get('outflow_size', 1000)
+    inflow_size = model_config.get('inflow_size', input_size)
+    outflow_size = model_config.get('outflow_size', input_size)
     
     # traffic feature extractor
     if model_name.lower() == "espresso":
@@ -181,7 +182,7 @@ if __name__ == "__main__":
     elif model_name.lower() == 'dcf':
         #inflow_fen = Conv1DModel(feature_dim, len(features), 
         #                         input_size=inflow_size)
-        inflow_fen = DFModel(input_shape=(len(features),1000), 
+        inflow_fen = DFModel(input_shape=(len(features),inflow_size), 
                              emb_size=feature_dim)
     inflow_fen = inflow_fen.to(device)
     inflow_fen.load_state_dict(resumed['inflow_fen'])
@@ -193,7 +194,7 @@ if __name__ == "__main__":
         elif model_name.lower() == "dcf":
             #outflow_fen = Conv1DModel(feature_dim, len(features), 
             #                          input_size=outflow_size)
-            outflow_fen = DFModel(input_shape=(len(features),1000), 
+            outflow_fen = DFModel(input_shape=(len(features),outflow_size), 
                                   emb_size=feature_dim)
         outflow_fen = outflow_fen.to(device)
         outflow_fen.load_state_dict(resumed['outflow_fen'])
@@ -320,7 +321,6 @@ if __name__ == "__main__":
     
     va_inflow_embeds, va_outflow_embeds = make_embeds(va_inflow, inflow_fen), make_embeds(va_outflow, outflow_fen)
     te_inflow_embeds, te_outflow_embeds = make_embeds(te_inflow, inflow_fen), make_embeds(te_outflow, outflow_fen)
-    print(va_inflow_embeds.shape, va_outflow_embeds.shape)
     #va_inflow_embeds, va_outflow_embeds = make_embeds(va_data, outflow_fen)
     #te_inflow_embeds, te_outflow_embeds = make_embeds(te_data, outflow_fen)
 
@@ -407,8 +407,6 @@ if __name__ == "__main__":
     
     va_sims, va_labels = build_sims(va_inflow_embeds, va_outflow_embeds)
     te_sims, te_labels = build_sims(te_inflow_embeds, te_outflow_embeds)
-    print(va_sims)
-    
     
     """
     if args.drift_features:

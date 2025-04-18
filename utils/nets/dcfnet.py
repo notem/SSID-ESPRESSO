@@ -1,10 +1,11 @@
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 
 class Conv1DModel(nn.Module):
-    def __init__(self, input_channels, input_size, feature_dim=64, **kwargs):
+    def __init__(self, feature_dim, input_channels, input_size=1000, **kwargs):
         super(Conv1DModel, self).__init__()
 
         self.dummy_param = nn.Parameter(torch.empty(0))
@@ -15,7 +16,7 @@ class Conv1DModel(nn.Module):
         self.filter_nums = [32, 64, 128, 256]
         self.kernel_size = 8
         self.conv_stride_size = 1
-        self.pool_stride_size = 4
+        self.pool_stride_size = 3
         self.pool_size = 8
         self.dropout_rate = 0.1
 
@@ -43,7 +44,7 @@ class Conv1DModel(nn.Module):
             self.pool_layers.append(nn.MaxPool1d(
                 kernel_size=self.pool_size,
                 stride=self.pool_stride_size,
-                padding=self.pool_size//2
+                padding=math.ceil(self.pool_size/2)
             ))
             self.dropout_layers.append(nn.Dropout(self.dropout_rate))
             in_channels = out_channels

@@ -183,15 +183,16 @@ if __name__ == "__main__":
     model_name = model_config.get('model', 'dcf')
     features = model_config['features']
     feature_dim = model_config['feature_dim']
-    inflow_size = model_config.get('inflow_size', 1000)
-    outflow_size = model_config.get('outflow_size', 1000)
+    input_size = 200
+    inflow_size = model_config.get('inflow_size', input_size)
+    outflow_size = model_config.get('outflow_size', input_size)
     
     # traffic feature extractor
     if model_name.lower() == "espresso":
         inflow_fen = EspressoNet(**model_config)
     elif model_name.lower() == 'dcf':
         #inflow_fen = DFNet(feature_dim, len(features), **model_config)
-        inflow_fen = DFModel(input_shape=(len(features),1000), 
+        inflow_fen = DFModel(input_shape=(len(features),inflow_size), 
                              emb_size=feature_dim)
     inflow_fen = inflow_fen.to(device)
     inflow_fen.load_state_dict(resumed['inflow_fen'])
@@ -203,7 +204,7 @@ if __name__ == "__main__":
         elif model_name.lower() == "dcf":
             #outflow_fen = DFNet(feature_dim, len(features),
             #                    **model_config)
-            outflow_fen = DFModel(input_shape=(len(features),1000), 
+            outflow_fen = DFModel(input_shape=(len(features),outflow_size), 
                                   emb_size=feature_dim)
         outflow_fen = outflow_fen.to(device)
         outflow_fen.load_state_dict(resumed['outflow_fen'])
